@@ -1,0 +1,10 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+*.log
+*-check.png
+package-*-stage/
+CodexPulse-Source-*.zip
+work-*
+.DS_Store

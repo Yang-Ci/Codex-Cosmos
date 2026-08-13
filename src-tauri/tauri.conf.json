@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Codex Cosmos",
+  "version": "1.0.0",
+  "identifier": "com.codexpulse.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Codex Cosmos",
+        "width": 184,
+        "height": 164,
+        "minWidth": 184,
+        "minHeight": 164,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "x": 24,
+        "y": 120,
+        "center": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost https://api.open-meteo.com https://geocoding-api.open-meteo.com; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "A cosmic desktop companion for Codex and daily focus",
+    "longDescription": "A cross-platform desktop companion that combines local Codex quota, time, weather, focus tools, safe recycle actions and playful desktop effects.",
+    "copyright": "Copyright 2026 Yang-Ci",
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "codex-cosmos",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --configLoader runner",
+    "build": "tsc && vite build --configLoader runner",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-autostart": "^2.5.0",
+    "@tauri-apps/plugin-notification": "^2.3.0",
+    "@tauri-apps/plugin-opener": "^2.5.0",
+    "@tauri-apps/plugin-store": "^2.4.0",
+    "lucide-react": "^0.539.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "recharts": "^3.1.2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.3",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.1.2"
+  }
+}
