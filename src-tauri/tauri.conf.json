@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Codex Cosmos",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "identifier": "com.codexpulse.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -36,6 +36,13 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "category": "Utility",
     "shortDescription": "A cosmic desktop companion for Codex and daily focus",
     "longDescription": "A cross-platform desktop companion that combines local Codex quota, time, weather, focus tools, safe recycle actions and playful desktop effects.",

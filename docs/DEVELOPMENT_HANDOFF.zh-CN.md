@@ -5,7 +5,7 @@
 ## 1. 当前基线
 
 - 产品名：Codex Cosmos
-- 版本：1.0.0
+- 版本：1.0.1
 - 仓库：`https://github.com/Yang-Ci/Codex-Cosmos`
 - 技术栈：Tauri 2 + React 19 + TypeScript + Rust 2021 + WGSL
 - 包管理器：pnpm 11
@@ -174,9 +174,9 @@ pnpm tauri build --bundles appimage,deb
 然后执行全部验证，提交到 `main`，最后打标签：
 
 ```bash
-git tag -a v1.0.1 -m "Codex Cosmos v1.0.1"
+git tag -a v1.0.2 -m "Codex Cosmos v1.0.2"
 git push origin main
-git push origin v1.0.1
+git push origin v1.0.2
 ```
 
 `.github/workflows/build.yml` 会在 `v*` 标签上构建 Windows NSIS、Windows 便携版、Linux AppImage 和 DEB，并创建 GitHub Release。发布后检查两个矩阵任务和 Release 附件；任何平台失败都不要只重打标签，应修复后递增补丁版本。

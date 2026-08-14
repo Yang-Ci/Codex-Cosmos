@@ -1,6 +1,6 @@
 [package]
 name = "codex-cosmos"
-version = "1.0.0"
+version = "1.0.1"
 description = "A cross-platform cosmic desktop companion for Codex quota, weather, focus and file utilities"
 authors = ["Yang-Ci"]
 edition = "2021"
