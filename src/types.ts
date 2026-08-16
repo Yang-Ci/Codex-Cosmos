@@ -141,3 +141,55 @@ export interface Settings {
   monthlyBudget: number;
   lowQuotaThreshold: number;
 }
+
+export interface UsageHeaderPair {
+  name: string;
+  value: string;
+}
+
+export interface UsageProviderConfig {
+  enabled: boolean;
+  name: string;
+  url: string;
+  method: "GET" | "POST";
+  body?: string | null;
+  usedPath: string;
+  totalPath: string;
+  breakdownPath?: string | null;
+  refreshMinutes: number;
+  headers: UsageHeaderPair[];
+  hasAuthorization?: boolean | null;
+}
+
+export interface UsageSegment {
+  label: string;
+  tokens: number;
+}
+
+export interface UsageSnapshot {
+  usedTokens: number;
+  totalTokens: number;
+  breakdown: UsageSegment[];
+  sampledAt: string;
+  source: string;
+}
+
+export type BalancePreset = "deepseek" | "openai-compatible";
+
+export interface BalanceProviderConfig {
+  enabled: boolean;
+  name: string;
+  preset: BalancePreset;
+  baseUrl: string;
+  refreshMinutes: number;
+  hasApiKey?: boolean | null;
+}
+
+export interface BalanceSnapshot {
+  currency: string;
+  totalBalance: string;
+  grantedBalance: string;
+  toppedUpBalance: string;
+  source: string;
+  sampledAt: string;
+}

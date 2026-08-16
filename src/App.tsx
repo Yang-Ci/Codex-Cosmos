@@ -61,6 +61,9 @@ import { describeWeather, fetchWeather, searchLocations } from "./weather";
 import { BlackHoleCanvas } from "./BlackHoleCanvas";
 import { DesktopEcosystem } from "./DesktopEcosystem";
 import type {
+  BalancePreset,
+  BalanceProviderConfig,
+  BalanceSnapshot,
   DropPhase,
   EffectCapabilities,
   EffectQuality,
@@ -72,6 +75,9 @@ import type {
   RecycleResult,
   Settings,
   TerrainMode,
+  UsageHeaderPair,
+  UsageProviderConfig,
+  UsageSnapshot,
   WeatherLocation,
   WeatherState,
   WeatherVisualMode,
@@ -263,7 +269,8 @@ function BlackHoleCore({
   count,
   message,
   onMouseDown,
-  onOpenTrash,
+  onWake,
+  onContextMenu,
   weather,
   weatherIntensity,
   recycledCount,
@@ -276,7 +283,8 @@ function BlackHoleCore({
   count: number;
   message: string;
   onMouseDown?: (event: React.MouseEvent<HTMLElement>) => void;
-  onOpenTrash?: () => void;
+  onWake?: () => void;
+  onContextMenu?: (event: React.MouseEvent<HTMLElement>) => void;
   weather?: WeatherState | null;
   weatherIntensity?: number;
   recycledCount?: number;
@@ -301,8 +309,9 @@ function BlackHoleCore({
     <div
       className={`black-hole black-hole-${phase}`}
       onMouseDown={onMouseDown}
-      onDoubleClick={onOpenTrash}
-      title={phase === "idle" ? "双击打开回收站 · 按住拖动位置" : undefined}
+      onDoubleClick={onWake}
+      onContextMenu={onContextMenu}
+      title={phase === "idle" ? "双击左键：额度面板 · 单击右键：回收站 · 双击右键：恢复上次" : undefined}
     >
       <BlackHoleCanvas
         phase={phase}
@@ -315,6 +324,96 @@ function BlackHoleCore({
         effectQuality={effectQuality}
       />
       <small>{status}</small>
+    </div>
+  );
+}
+
+function formatUsageTokens(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return `${Math.round(value)}`;
+}
+
+function UsageMeter({
+  usage,
+  error,
+  loading,
+  source,
+}: {
+  usage: UsageSnapshot | null;
+  error: string | null;
+  loading: boolean;
+  source: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const total = usage?.totalTokens ?? 0;
+  const used = usage?.usedTokens ?? 0;
+  const percent = total > 0 ? Math.min(100, Math.max(0, (used / total) * 100)) : 0;
+  const breakdown = usage?.breakdown ?? [];
+  const breakdownTotal = breakdown.reduce((sum, segment) => sum + segment.tokens, 0);
+  const available = usage !== null;
+  const R = 40;
+  const C = 2 * Math.PI * R;
+
+  return (
+    <div className={`usage-meter ${available ? "usage-available" : ""}`}>
+      <button
+        className="usage-trigger"
+        onClick={() => available && setOpen((current) => !current)}
+        title={error ? `配置错误：${error}` : "自定义用量 API"}
+      >
+        <svg viewBox="0 0 100 100" width="66" height="66" aria-hidden>
+          <circle className="usage-track" cx="50" cy="50" r={R} />
+          <circle
+            className="usage-fill"
+            cx="50"
+            cy="50"
+            r={R}
+            strokeDasharray={`${(C * percent) / 100} ${C}`}
+            transform="rotate(-90 50 50)"
+          />
+        </svg>
+        <span className="usage-percent">{Math.round(percent)}%</span>
+      </button>
+      <div className="usage-caption">
+        <strong>
+          {available
+            ? `${formatUsageTokens(used)} / ${formatUsageTokens(total)}`
+            : loading
+              ? "加载中"
+              : error
+                ? "配置错误"
+                : "未启用"}
+        </strong>
+        <small>{source || "自定义用量"}</small>
+      </div>
+      {open && available && (
+        <div className="usage-panel">
+          <div className="usage-panel-head">
+            <span>{source || "自定义用量"}</span>
+            <strong>{Math.round(percent)}%</strong>
+          </div>
+          <div className="usage-bar">
+            {(breakdown.length > 0 ? breakdown : [{ label: "总量", tokens: used }]).map((segment, index) => (
+              <div
+                key={`${segment.label}-${index}`}
+                className="usage-segment"
+                style={{ width: `${(segment.tokens / (breakdownTotal || total || 1)) * 100}%` }}
+              />
+            ))}
+          </div>
+          {breakdown.length > 0 && (
+            <div className="usage-rows">
+              {breakdown.map((segment, index) => (
+                <div key={`${segment.label}-${index}`} className="usage-row">
+                  <span>{segment.label}</span>
+                  <strong>{formatUsageTokens(segment.tokens)}</strong>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -342,10 +441,27 @@ function App() {
   const [capabilities, setCapabilities] = useState<EffectCapabilities | null>(null);
   const [terrainImpact, setTerrainImpact] = useState<{ id: number; x: number; y: number } | null>(null);
   const [wormholeExit, setWormholeExit] = useState(() => randomWormholeExit());
+  const [usageProvider, setUsageProvider] = useState<UsageProviderConfig | null>(null);
+  const [usage, setUsage] = useState<UsageSnapshot | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const [loadingUsage, setLoadingUsage] = useState(false);
+  const [providerDraft, setProviderDraft] = useState<UsageProviderConfig | null>(null);
+  const [authorizationDraft, setAuthorizationDraft] = useState("");
+  const [headersDraft, setHeadersDraft] = useState("");
+  const [balanceProvider, setBalanceProvider] = useState<BalanceProviderConfig | null>(null);
+  const [balance, setBalance] = useState<BalanceSnapshot | null>(null);
+  const [balanceError, setBalanceError] = useState<string | null>(null);
+  const [loadingBalance, setLoadingBalance] = useState(false);
+  const [balanceDraft, setBalanceDraft] = useState<BalanceProviderConfig | null>(null);
+  const [balanceApiKeyDraft, setBalanceApiKeyDraft] = useState("");
+  const [dragging, setDragging] = useState(false);
+  const dragEndedAt = useRef(0);
   const collapseTimer = useRef<number | null>(null);
   const hoverTimer = useRef<number | null>(null);
   const feedbackTimer = useRef<number | null>(null);
   const dragReleaseTimer = useRef<number | null>(null);
+  const contextMenuTimer = useRef<number | null>(null);
+  const lastContextMenuRef = useRef(0);
   const manualWindowDrag = useRef(false);
   const nativeFileDrag = useRef(false);
   const pointerInsideRef = useRef(false);
@@ -421,6 +537,76 @@ function App() {
     }
   }, [settings.location, settings.weatherEnabled]);
 
+  const loadUsageProvider = useCallback(async () => {
+    if (!isTauri) return;
+    try {
+      setUsageProvider(await invoke<UsageProviderConfig>("get_usage_provider"));
+    } catch {
+      setUsageProvider(null);
+    }
+  }, []);
+
+  const loadUsage = useCallback(async () => {
+    if (!isTauri) return;
+    let config: UsageProviderConfig | null = null;
+    try {
+      config = await invoke<UsageProviderConfig>("get_usage_provider");
+      setUsageProvider(config);
+    } catch {
+      setUsageProvider(null);
+    }
+    if (!config?.enabled) {
+      setUsage(null);
+      setUsageError(null);
+      return;
+    }
+    setLoadingUsage(true);
+    setUsageError(null);
+    try {
+      setUsage(await invoke<UsageSnapshot>("fetch_custom_usage"));
+    } catch (error) {
+      setUsage(null);
+      setUsageError(String(error));
+    } finally {
+      setLoadingUsage(false);
+    }
+  }, []);
+
+  const loadBalanceProvider = useCallback(async () => {
+    if (!isTauri) return;
+    try {
+      setBalanceProvider(await invoke<BalanceProviderConfig>("get_balance_provider"));
+    } catch {
+      setBalanceProvider(null);
+    }
+  }, []);
+
+  const loadBalance = useCallback(async () => {
+    if (!isTauri) return;
+    let config: BalanceProviderConfig | null = null;
+    try {
+      config = await invoke<BalanceProviderConfig>("get_balance_provider");
+      setBalanceProvider(config);
+    } catch {
+      setBalanceProvider(null);
+    }
+    if (!config?.enabled) {
+      setBalance(null);
+      setBalanceError(null);
+      return;
+    }
+    setLoadingBalance(true);
+    setBalanceError(null);
+    try {
+      setBalance(await invoke<BalanceSnapshot>("fetch_balance_snapshot"));
+    } catch (error) {
+      setBalance(null);
+      setBalanceError(String(error));
+    } finally {
+      setLoadingBalance(false);
+    }
+  }, []);
+
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 1000);
     return () => window.clearInterval(timer);
@@ -437,6 +623,24 @@ function App() {
     const timer = window.setInterval(loadWeather, 15 * 60_000);
     return () => window.clearInterval(timer);
   }, [loadWeather]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    void loadUsageProvider();
+    void loadUsage();
+    const minutes = Math.max(1, usageProvider?.refreshMinutes ?? 5);
+    const timer = window.setInterval(loadUsage, minutes * 60_000);
+    return () => window.clearInterval(timer);
+  }, [loadUsage, loadUsageProvider, usageProvider?.refreshMinutes]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    void loadBalanceProvider();
+    void loadBalance();
+    const minutes = Math.max(1, balanceProvider?.refreshMinutes ?? 30);
+    const timer = window.setInterval(loadBalance, minutes * 60_000);
+    return () => window.clearInterval(timer);
+  }, [loadBalance, loadBalanceProvider, balanceProvider?.refreshMinutes]);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -646,6 +850,7 @@ function App() {
     if (feedbackTimer.current !== null) window.clearTimeout(feedbackTimer.current);
     if (dragReleaseTimer.current !== null) window.clearTimeout(dragReleaseTimer.current);
     if (cometTimer.current !== null) window.clearTimeout(cometTimer.current);
+    if (contextMenuTimer.current !== null) window.clearTimeout(contextMenuTimer.current);
   }, []);
 
   const updateSize = (size: WidgetSize) => {
@@ -736,32 +941,171 @@ function App() {
     }
   };
 
+  const parseHeaders = (text: string): UsageHeaderPair[] => text
+    .split("\n")
+    .map((line) => {
+      const separator = line.indexOf(":");
+      if (separator < 0) return null;
+      const name = line.slice(0, separator).trim();
+      const value = line.slice(separator + 1).trim();
+      return name ? { name, value } : null;
+    })
+    .filter((header): header is UsageHeaderPair => header !== null);
+
+  const openUsageProviderEditor = () => {
+    const config = usageProvider ?? {
+      enabled: false,
+      name: "",
+      url: "",
+      method: "GET" as const,
+      body: null,
+      usedPath: "/used",
+      totalPath: "/total",
+      breakdownPath: null,
+      refreshMinutes: 5,
+      headers: [],
+    };
+    setProviderDraft(config);
+    setHeadersDraft(config.headers.map((header) => `${header.name}: ${header.value}`).join("\n"));
+    setAuthorizationDraft("");
+  };
+
+  const saveUsageProvider = async () => {
+    if (!providerDraft || !isTauri) return false;
+    const config: UsageProviderConfig = { ...providerDraft, headers: parseHeaders(headersDraft) };
+    try {
+      const saved = await invoke<UsageProviderConfig>("set_usage_provider", {
+        config,
+        authorization: authorizationDraft.trim() ? authorizationDraft : null,
+      });
+      setUsageProvider(saved);
+      setProviderDraft(saved);
+      await loadUsage();
+      return true;
+    } catch (error) {
+      setDropState({ phase: "error", paths: [], message: String(error) });
+      clearFeedbackLater(3600);
+      return false;
+    }
+  };
+
+  const testUsageProvider = async () => {
+    const saved = await saveUsageProvider();
+    if (!saved) return;
+    setDropState({ phase: "processing", paths: [], message: "正在测试自定义用量 API" });
+    try {
+      const snapshot = await invoke<UsageSnapshot>("fetch_custom_usage");
+      setUsage(snapshot);
+      setUsageError(null);
+      setDropState({ phase: "success", paths: [], message: `测试成功：${formatUsageTokens(snapshot.usedTokens)} / ${formatUsageTokens(snapshot.totalTokens)}` });
+      clearFeedbackLater(2600);
+    } catch (error) {
+      setUsage(null);
+      setUsageError(String(error));
+      setDropState({ phase: "error", paths: [], message: String(error) });
+      clearFeedbackLater(3600);
+    }
+  };
+
+  const openBalanceEditor = () => {
+    const config = balanceProvider ?? {
+      enabled: false,
+      name: "DeepSeek",
+      preset: "deepseek" as BalancePreset,
+      baseUrl: "",
+      refreshMinutes: 30,
+    };
+    setBalanceDraft(config);
+    setBalanceApiKeyDraft("");
+  };
+
+  const saveBalanceProvider = async () => {
+    if (!balanceDraft || !isTauri) return false;
+    try {
+      const saved = await invoke<BalanceProviderConfig>("set_balance_provider", {
+        config: balanceDraft,
+        apiKey: balanceApiKeyDraft.trim() ? balanceApiKeyDraft.trim() : null,
+      });
+      setBalanceProvider(saved);
+      setBalanceDraft(saved);
+      await loadBalance();
+      return true;
+    } catch (error) {
+      setDropState({ phase: "error", paths: [], message: String(error) });
+      clearFeedbackLater(3600);
+      return false;
+    }
+  };
+
+  const testBalanceProvider = async () => {
+    const saved = await saveBalanceProvider();
+    if (!saved) return;
+    setDropState({ phase: "processing", paths: [], message: "正在查询余额" });
+    try {
+      const snapshot = await invoke<BalanceSnapshot>("fetch_balance_snapshot");
+      setBalance(snapshot);
+      setBalanceError(null);
+      setDropState({ phase: "success", paths: [], message: `余额：${snapshot.totalBalance} ${snapshot.currency}` });
+      clearFeedbackLater(2600);
+    } catch (error) {
+      setBalance(null);
+      setBalanceError(String(error));
+      setDropState({ phase: "error", paths: [], message: String(error) });
+      clearFeedbackLater(3600);
+    }
+  };
+
   const beginWindowDrag = (event: React.MouseEvent<HTMLElement>) => {
     if (!isTauri || event.button !== 0 || settingsOpen) return;
 
     const target = event.target as HTMLElement;
     if (target.closest("button, input, a, [role='button']")) return;
 
-    if (hoverTimer.current !== null) {
-      window.clearTimeout(hoverTimer.current);
-      hoverTimer.current = null;
-    }
-    if (collapseTimer.current !== null) {
-      window.clearTimeout(collapseTimer.current);
-      collapseTimer.current = null;
-    }
-    manualWindowDrag.current = true;
-    suppressWakeUntilLeave.current = true;
-    if ((event.currentTarget as HTMLElement).classList.contains("black-hole")) {
-      setAwake(false);
-    }
-    void getCurrentWindow().startDragging().finally(() => {
-      if (dragReleaseTimer.current !== null) window.clearTimeout(dragReleaseTimer.current);
-      dragReleaseTimer.current = window.setTimeout(() => {
-        manualWindowDrag.current = false;
-        dragReleaseTimer.current = null;
-      }, 180);
-    });
+    const dragTarget = event.currentTarget as HTMLElement;
+    const startX = event.screenX;
+    const startY = event.screenY;
+
+    const cleanup = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+
+    const startNativeDrag = () => {
+      cleanup();
+      if (hoverTimer.current !== null) {
+        window.clearTimeout(hoverTimer.current);
+        hoverTimer.current = null;
+      }
+      if (collapseTimer.current !== null) {
+        window.clearTimeout(collapseTimer.current);
+        collapseTimer.current = null;
+      }
+      manualWindowDrag.current = true;
+      setDragging(true);
+      suppressWakeUntilLeave.current = true;
+      if (dragTarget.classList.contains("black-hole")) {
+        setAwake(false);
+      }
+      void getCurrentWindow().startDragging().finally(() => {
+        if (dragReleaseTimer.current !== null) window.clearTimeout(dragReleaseTimer.current);
+        dragReleaseTimer.current = window.setTimeout(() => {
+          manualWindowDrag.current = false;
+          dragReleaseTimer.current = null;
+          dragEndedAt.current = Date.now();
+          setDragging(false);
+        }, 180);
+      });
+    };
+
+    const onMove = (moveEvent: MouseEvent) => {
+      if (Math.abs(moveEvent.screenX - startX) > 5 || Math.abs(moveEvent.screenY - startY) > 5) {
+        startNativeDrag();
+      }
+    };
+    const onUp = () => cleanup();
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   };
 
   const wakeWidget = () => {
@@ -779,28 +1123,6 @@ function App() {
       setAwake(false);
       collapseTimer.current = null;
     }, 850);
-  };
-
-  const scheduleWakeWidget = () => {
-    if (
-      dropState.phase !== "idle"
-      || awake
-      || manualWindowDrag.current
-      || nativeFileDrag.current
-      || suppressWakeUntilLeave.current
-      || hoverTimer.current !== null
-    ) return;
-    hoverTimer.current = window.setTimeout(() => {
-      hoverTimer.current = null;
-      if (
-        dropState.phase === "idle"
-        && !manualWindowDrag.current
-        && !nativeFileDrag.current
-        && !suppressWakeUntilLeave.current
-      ) {
-        wakeWidget();
-      }
-    }, 900);
   };
 
   useEffect(() => {
@@ -828,7 +1150,6 @@ function App() {
             window.clearTimeout(collapseTimer.current);
             collapseTimer.current = null;
           }
-          if (!suppressWakeUntilLeave.current) scheduleWakeWidget();
         } else {
           suppressWakeUntilLeave.current = false;
           if (hoverTimer.current !== null) {
@@ -856,6 +1177,7 @@ function App() {
       || settingsOpen
       || dropState.phase !== "idle"
       || focusSession.running
+      || dragging
     ) return;
 
     let cancelled = false;
@@ -917,6 +1239,7 @@ function App() {
             || pointerInsideRef.current
             || manualWindowDrag.current
             || nativeFileDrag.current
+            || Date.now() - dragEndedAt.current < 8000
           ) return;
           moving = true;
           try {
@@ -944,7 +1267,7 @@ function App() {
       cancelled = true;
       if (timer !== undefined) window.clearInterval(timer);
     };
-  }, [awake, capabilities?.programmaticPositioning, dropState.phase, focusSession.running, settings.idleDriftEnabled, settingsOpen]);
+  }, [awake, capabilities?.programmaticPositioning, dropState.phase, dragging, focusSession.running, settings.idleDriftEnabled, settingsOpen]);
 
   const openTrash = () => {
     if (isTauri) void invoke("open_recycle_bin");
@@ -965,6 +1288,26 @@ function App() {
     } catch (error) {
       setDropState({ phase: "error", paths: [], message: String(error) });
       clearFeedbackLater(3800);
+    }
+  };
+
+  const handleBlackHoleContextMenu = (event: React.MouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    const now = Date.now();
+    if (now - lastContextMenuRef.current < 500) {
+      lastContextMenuRef.current = 0;
+      if (contextMenuTimer.current !== null) {
+        window.clearTimeout(contextMenuTimer.current);
+        contextMenuTimer.current = null;
+      }
+      void restoreLastRecycle();
+    } else {
+      lastContextMenuRef.current = now;
+      if (contextMenuTimer.current !== null) window.clearTimeout(contextMenuTimer.current);
+      contextMenuTimer.current = window.setTimeout(() => {
+        contextMenuTimer.current = null;
+        openTrash();
+      }, 450);
     }
   };
 
@@ -1033,7 +1376,8 @@ function App() {
           count={dropState.paths.length}
           message={dropState.message}
           onMouseDown={beginWindowDrag}
-          onOpenTrash={openTrash}
+          onWake={wakeWidget}
+          onContextMenu={handleBlackHoleContextMenu}
           weather={visualWeather}
           weatherIntensity={weatherIntensity}
           recycledCount={ecosystemStats.totalRecycled}
@@ -1136,6 +1480,36 @@ function App() {
             <div className="weather-note">{weather ? `${describeWeather(weather.weatherCode).label} · 体感 ${Math.round(weather.apparentTemperature)}°` : loadingWeather ? "正在获取天气" : "天气暂不可用"}</div>
           </div>
         </section>
+
+        {usageProvider?.enabled && (
+          <section className="usage-card">
+            <div className="usage-card-head">
+              <span><i className="status-light" /> CUSTOM USAGE</span>
+              <button className="text-button" onClick={loadUsage} disabled={loadingUsage}><RefreshCw size={12} className={loadingUsage ? "spin" : ""} />刷新</button>
+            </div>
+            <UsageMeter usage={usage} error={usageError} loading={loadingUsage} source={usageProvider.name} />
+          </section>
+        )}
+
+        {balanceProvider?.enabled && (
+          <section className="balance-card">
+            <div className="balance-card-head">
+              <span><i className="status-light" /> BALANCE</span>
+              <button className="text-button" onClick={loadBalance} disabled={loadingBalance}><RefreshCw size={12} className={loadingBalance ? "spin" : ""} />刷新</button>
+            </div>
+            <div className="balance-main">
+              <strong>{balance ? balance.totalBalance : loadingBalance ? "…" : balanceError ? "—" : "--"}</strong>
+              <span>{balance?.currency ?? ""}</span>
+            </div>
+            {balance && (balance.grantedBalance || balance.toppedUpBalance) && (
+              <div className="balance-sub">
+                {balance.grantedBalance && <span>赠送 {balance.grantedBalance}</span>}
+                {balance.toppedUpBalance && <span>充值 {balance.toppedUpBalance}</span>}
+              </div>
+            )}
+            {balanceError && <small className="balance-error">{balanceError}</small>}
+          </section>
+        )}
 
         <section className="quota-card">
           <div className="quota-heading">
@@ -1268,9 +1642,50 @@ function App() {
                 <label>默认显示尺寸</label>
                 <div className="segmented">{(["compact", "standard", "expanded"] as WidgetSize[]).map((size) => <button key={size} className={settings.size === size ? "active" : ""} onClick={() => updateSize(size)}>{size === "compact" ? "极简" : size === "standard" ? "标准" : "展开"}</button>)}</div>
               </div>
+              <div className="setting-group usage-provider-group">
+                <label>余额查询 <b>{balanceProvider?.enabled ? "已启用" : "已关闭"}</b></label>
+                {balanceDraft ? (
+                  <>
+                    <div className="setting-row"><div><strong>启用</strong><span>只填 API Key 读余额</span></div><button className={`toggle ${balanceDraft.enabled ? "on" : ""}`} onClick={() => setBalanceDraft({ ...balanceDraft, enabled: !balanceDraft.enabled })}><i /></button></div>
+                    <div className="segmented">{([["deepseek", "DeepSeek 官方"], ["openai-compatible", "中转站"]] as [BalancePreset, string][]).map(([preset, label]) => <button key={preset} className={balanceDraft.preset === preset ? "active" : ""} onClick={() => setBalanceDraft({ ...balanceDraft, preset })}>{label}</button>)}</div>
+                    {balanceDraft.preset === "openai-compatible" && <div className="search-box provider-field"><input value={balanceDraft.baseUrl} onChange={(event) => setBalanceDraft({ ...balanceDraft, baseUrl: event.target.value })} placeholder="中转站地址 https://…" /></div>}
+                    <div className="search-box provider-field"><input type="password" value={balanceApiKeyDraft} onChange={(event) => setBalanceApiKeyDraft(event.target.value)} placeholder={balanceProvider?.hasApiKey ? "API Key 已存（留空不变）" : "API Key"} /></div>
+                    <div className="provider-actions">
+                      <button className="provider-save" onClick={saveBalanceProvider}>保存</button>
+                      <button className="provider-test" onClick={testBalanceProvider}>测试</button>
+                    </div>
+                    <small className="setting-hint">DeepSeek 官方自动读 /user/balance；中转站填 base 地址后同样读 /user/balance。Key 存系统凭据库。</small>
+                  </>
+                ) : (
+                  <button className="text-button" onClick={openBalanceEditor}>打开配置</button>
+                )}
+              </div>
+              <div className="setting-group usage-provider-group">
+                <label>自定义用量 API <b>{usageProvider?.enabled ? "已启用" : "已关闭"}</b></label>
+                {providerDraft ? (
+                  <>
+                    <div className="setting-row"><div><strong>启用</strong><span>从自定义接口读取 token 用量</span></div><button className={`toggle ${providerDraft.enabled ? "on" : ""}`} onClick={() => setProviderDraft({ ...providerDraft, enabled: !providerDraft.enabled })}><i /></button></div>
+                    <div className="search-box provider-field"><input value={providerDraft.url} onChange={(event) => setProviderDraft({ ...providerDraft, url: event.target.value })} placeholder="API 地址 https://…" /></div>
+                    <div className="search-box provider-field"><input value={providerDraft.name} onChange={(event) => setProviderDraft({ ...providerDraft, name: event.target.value })} placeholder="名称（可选）" /></div>
+                    <div className="segmented">{(["GET", "POST"] as const).map((method) => <button key={method} className={providerDraft.method === method ? "active" : ""} onClick={() => setProviderDraft({ ...providerDraft, method })}>{method}</button>)}</div>
+                    <div className="search-box provider-field"><input value={providerDraft.usedPath} onChange={(event) => setProviderDraft({ ...providerDraft, usedPath: event.target.value })} placeholder="已用路径 /used" /></div>
+                    <div className="search-box provider-field"><input value={providerDraft.totalPath} onChange={(event) => setProviderDraft({ ...providerDraft, totalPath: event.target.value })} placeholder="总量路径 /total" /></div>
+                    <div className="search-box provider-field"><input value={providerDraft.breakdownPath ?? ""} onChange={(event) => setProviderDraft({ ...providerDraft, breakdownPath: event.target.value || null })} placeholder="分段路径（可选）/breakdown" /></div>
+                    <div className="search-box provider-field"><input type="password" value={authorizationDraft} onChange={(event) => setAuthorizationDraft(event.target.value)} placeholder={usageProvider?.hasAuthorization ? "Authorization 已存（留空不变）" : "Authorization 凭据"} /></div>
+                    <textarea className="headers-box" value={headersDraft} onChange={(event) => setHeadersDraft(event.target.value)} placeholder={"额外请求头，每行一条 Name: Value"} rows={2} />
+                    <div className="provider-actions">
+                      <button className="provider-save" onClick={saveUsageProvider}>保存</button>
+                      <button className="provider-test" onClick={testUsageProvider}>测试</button>
+                    </div>
+                    <small className="setting-hint">响应为 JSON，需含已用/总量数值；分段是 [{`{"label":"…","tokens":…}`}] 数组。Authorization 存系统凭据库，不写入配置。</small>
+                  </>
+                ) : (
+                  <button className="text-button" onClick={openUsageProviderEditor}>打开配置</button>
+                )}
+              </div>
               <div className="privacy-note"><LocateFixed size={15}/><p><strong>隐私优先</strong><span>Codex 额度只读取本机事件；天气仅发送你选择的城市坐标，不读取账号令牌。</span></p></div>
               {capabilities && <div className="capability-card liquid-glass-tag"><strong>{capabilities.desktopCapture ? "实时桌面透镜" : "安全降级模式"}</strong><span>{capabilities.platform} · {capabilities.session}{capabilities.fallbackReason ? ` · ${capabilities.fallbackReason}` : " · 当前显示器独立采样"}</span></div>}
-              <div className="settings-version">CODEX COSMOS 1.0.1 · RUGGED DESKTOP</div>
+              <div className="settings-version">CODEX COSMOS 1.0.2 · RUGGED DESKTOP</div>
             </aside>
           </div>
         )}

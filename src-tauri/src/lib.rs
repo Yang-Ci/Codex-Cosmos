@@ -2,6 +2,8 @@ mod desktop_capture;
 mod ecosystem;
 mod quota;
 mod recycle;
+mod usage;
+mod balance;
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -104,7 +106,13 @@ pub fn run() {
             ecosystem::move_through_wormhole,
             ecosystem::forge_files,
             ecosystem::clipboard_text,
-            ecosystem::set_clipboard_text
+            ecosystem::set_clipboard_text,
+            usage::get_usage_provider,
+            usage::set_usage_provider,
+            usage::fetch_custom_usage,
+            balance::get_balance_provider,
+            balance::set_balance_provider,
+            balance::fetch_balance_snapshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Cosmos");
