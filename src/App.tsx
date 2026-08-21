@@ -5,7 +5,6 @@ import {
   currentMonitor,
   cursorPosition,
   getCurrentWindow,
-  LogicalSize,
   PhysicalPosition,
 } from "@tauri-apps/api/window";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
@@ -28,6 +27,7 @@ import {
   Copy,
   Droplets,
   Expand,
+  Flame,
   FolderInput,
   LocateFixed,
   MapPin,
@@ -52,15 +52,18 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
+  YAxis,
 } from "recharts";
 import { quoteOfTheDay } from "./quotes";
 import { describeWeather, fetchWeather, searchLocations } from "./weather";
 import { BlackHoleCanvas } from "./BlackHoleCanvas";
 import { DesktopEcosystem } from "./DesktopEcosystem";
 import type {
+  BalanceDetailsSnapshot,
   BalancePreset,
   BalanceProviderConfig,
   BalanceSnapshot,
@@ -92,7 +95,41 @@ interface DropState {
   target?: "trash" | "wormhole" | "forge";
 }
 
-const isTauri = detectTauri();
+type DropTarget = NonNullable<DropState["target"]>;
+
+const isTauri = detectTauri()
+  || (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window);
+
+function resolveDropTarget(
+  physicalX: number,
+  physicalY: number,
+  logicalWidth: number,
+  logicalHeight: number,
+  scaleFactor: number,
+): DropTarget {
+  const scale = Math.max(0.1, scaleFactor || 1);
+  const x = physicalX / scale;
+  const y = physicalY / scale;
+  const idleCanvas = logicalWidth <= 220 && logicalHeight <= 200;
+  if (idleCanvas) {
+    if (x < 70 && y > 88) return "wormhole";
+    if (x > 116 && y > 88) return "forge";
+    return "trash";
+  }
+  if (x < logicalWidth / 3) return "wormhole";
+  if (x > logicalWidth * 2 / 3) return "forge";
+  return "trash";
+}
+
+function DropTargetGuide({ target }: { target?: DropTarget }) {
+  return (
+    <div className="drop-target-guide" aria-hidden="true">
+      <div className={target === "wormhole" ? "active wormhole" : "wormhole"}><FolderInput size={18} /><strong>传送门</strong><small>移动文件</small></div>
+      <div className={target === "trash" ? "active trash" : "trash"}><Trash2 size={18} /><strong>回收站</strong><small>安全回收</small></div>
+      <div className={target === "forge" ? "active forge" : "forge"}><Flame size={18} /><strong>星炉</strong><small>压缩 / 解压</small></div>
+    </div>
+  );
+}
 
 const storageKeys = {
   focus: "codex-cosmos-focus",
@@ -132,6 +169,7 @@ const defaultSettings: Settings = {
   quoteCategory: "mixed",
   weatherEnabled: true,
   weatherVisualMode: "immersive",
+  autoCollapseEnabled: true,
   idleDriftEnabled: true,
   terrainMode: "gravity",
   terrainIntensity: 65,
@@ -165,12 +203,53 @@ const mockPulse: PulseData = {
 };
 
 const sizeMap: Record<WidgetSize, { width: number; height: number }> = {
-  compact: { width: 430, height: 116 },
+  compact: { width: 430, height: 72 },
   standard: { width: 430, height: 570 },
   expanded: { width: 760, height: 620 },
 };
 
 const idleSize = { width: 184, height: 164 };
+const quotaResetToleranceSeconds = 5 * 60;
+
+function buildQuotaTrend(history: PulseData["history"]) {
+  const sorted = [...history].sort((left, right) => left.sampledAt - right.sampledAt);
+  const latestReset = sorted.at(-1)?.resetsAt;
+  let cycleStart = 0;
+
+  if (latestReset != null && latestReset > 0) {
+    cycleStart = sorted.length - 1;
+    while (cycleStart > 0) {
+      const previousReset = sorted[cycleStart - 1].resetsAt;
+      if (
+        previousReset == null
+        || previousReset <= 0
+        || Math.abs(previousReset - latestReset) > quotaResetToleranceSeconds
+      ) break;
+      cycleStart -= 1;
+    }
+  }
+
+  const currentCycle = sorted.slice(cycleStart);
+  let peakUsed = 0;
+  const data = currentCycle.map((point) => {
+    peakUsed = Math.max(peakUsed, Math.min(100, Math.max(0, point.usedPercent)));
+    return { sampledAt: point.sampledAt, used: peakUsed };
+  });
+  const first = currentCycle.at(0)?.sampledAt ?? 0;
+  const last = currentCycle.at(-1)?.sampledAt ?? first;
+  const previousReset = cycleStart > 0 ? sorted[cycleStart - 1].resetsAt : undefined;
+  const hasRealReset = latestReset != null
+    && latestReset > 0
+    && previousReset != null
+    && previousReset > 0
+    && Math.abs(previousReset - latestReset) > quotaResetToleranceSeconds;
+
+  return {
+    data,
+    resetAt: hasRealReset ? first : null,
+    spanSeconds: Math.max(0, last - first),
+  };
+}
 
 const wormholeExitPoints = [
   { x: 94, y: 20, angle: -8 },
@@ -430,7 +509,9 @@ function App() {
   const [locationQuery, setLocationQuery] = useState("");
   const [locationResults, setLocationResults] = useState<WeatherLocation[]>([]);
   const [copied, setCopied] = useState(false);
-  const [awake, setAwake] = useState(!isTauri);
+  // The auto-collapse setting controls what happens after the panel is opened;
+  // it should not force the panel open on every application launch.
+  const [awake, setAwake] = useState(() => !isTauri);
   const [dropState, setDropState] = useState<DropState>({ phase: "idle", paths: [], message: "" });
   const [recycleHistory, setRecycleHistory] = useState<RecycleBatch[]>([]);
   const [ecosystemStats, setEcosystemStats] = useState<EcosystemStats>(defaultEcosystemStats);
@@ -454,6 +535,11 @@ function App() {
   const [loadingBalance, setLoadingBalance] = useState(false);
   const [balanceDraft, setBalanceDraft] = useState<BalanceProviderConfig | null>(null);
   const [balanceApiKeyDraft, setBalanceApiKeyDraft] = useState("");
+  const [balanceAccountTokenDraft, setBalanceAccountTokenDraft] = useState("");
+  const [balanceDetailsOpen, setBalanceDetailsOpen] = useState(false);
+  const [balanceDetails, setBalanceDetails] = useState<BalanceDetailsSnapshot | null>(null);
+  const [balanceDetailsError, setBalanceDetailsError] = useState<string | null>(null);
+  const [loadingBalanceDetails, setLoadingBalanceDetails] = useState(false);
   const [dragging, setDragging] = useState(false);
   const dragEndedAt = useRef(0);
   const collapseTimer = useRef<number | null>(null);
@@ -465,6 +551,7 @@ function App() {
   const manualWindowDrag = useRef(false);
   const nativeFileDrag = useRef(false);
   const pointerInsideRef = useRef(false);
+  const windowScaleFactorRef = useRef(1);
   const suppressWakeUntilLeave = useRef(false);
   const dropTargetRef = useRef<"trash" | "wormhole" | "forge">("trash");
   const lastClipboardRef = useRef<string | null>(null);
@@ -696,15 +783,33 @@ function App() {
 
   useEffect(() => {
     if (!isTauri) return;
+    const appWindow = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    void appWindow.scaleFactor().then((factor) => {
+      windowScaleFactorRef.current = factor;
+    });
+    void appWindow.onScaleChanged(({ payload }) => {
+      windowScaleFactorRef.current = payload.scaleFactor;
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onDragDropEvent(({ payload }) => {
       const targetAt = (x: number, y: number) => {
-        const scale = window.devicePixelRatio || 1;
-        const idleCanvas = window.innerWidth <= 220 && window.innerHeight <= 200;
-        if (!idleCanvas) return "trash" as const;
-        if (x / scale < 70 && y / scale > 88) return "wormhole" as const;
-        if (x / scale > 116 && y / scale > 88) return "forge" as const;
-        return "trash" as const;
+        const linuxWebKitCoordinatesAreLogical = capabilities?.platform === "linux"
+          || navigator.userAgent.toLowerCase().includes("linux");
+        return resolveDropTarget(
+          x,
+          y,
+          window.innerWidth,
+          window.innerHeight,
+          linuxWebKitCoordinatesAreLogical ? 1 : windowScaleFactorRef.current,
+        );
       };
       if (payload.type === "enter") {
         if (feedbackTimer.current !== null) window.clearTimeout(feedbackTimer.current);
@@ -782,7 +887,7 @@ function App() {
         : Promise.resolve();
       void Promise.all([operation, transferAnimation])
         .then(([result]) => {
-          setAwake(false);
+          if (settings.autoCollapseEnabled) setAwake(false);
           setDropState({
             phase: "success",
             paths: [],
@@ -805,7 +910,7 @@ function App() {
       unlisten = dispose;
     });
     return () => unlisten?.();
-  }, [clearFeedbackLater, ecosystemStats.wormholeDestination, loadEcosystemStats, loadRecycleHistory]);
+  }, [capabilities?.platform, clearFeedbackLater, ecosystemStats.wormholeDestination, loadEcosystemStats, loadRecycleHistory, settings.autoCollapseEnabled]);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -837,7 +942,7 @@ function App() {
   useEffect(() => {
     if (!isTauri) return;
     const target = awake || settingsOpen ? sizeMap[settings.size] : idleSize;
-    void getCurrentWindow().setSize(new LogicalSize(target.width, target.height));
+    void invoke("set_widget_size", { width: target.width, height: target.height });
   }, [awake, settings.size, settingsOpen]);
 
   useEffect(() => {
@@ -871,6 +976,23 @@ function App() {
       else await disable();
     }
     saveSettings({ ...settings, autostart: next });
+  };
+
+  const toggleAutoCollapse = () => {
+    const next = !settings.autoCollapseEnabled;
+    if (!next) {
+      if (collapseTimer.current !== null) {
+        window.clearTimeout(collapseTimer.current);
+        collapseTimer.current = null;
+      }
+      if (hoverTimer.current !== null) {
+        window.clearTimeout(hoverTimer.current);
+        hoverTimer.current = null;
+      }
+      suppressWakeUntilLeave.current = false;
+      setAwake(true);
+    }
+    saveSettings({ ...settings, autoCollapseEnabled: next });
   };
 
   const performLocationSearch = async () => {
@@ -1013,10 +1135,12 @@ function App() {
       name: "DeepSeek",
       preset: "deepseek" as BalancePreset,
       baseUrl: "",
+      accountUserId: "",
       refreshMinutes: 30,
     };
     setBalanceDraft(config);
     setBalanceApiKeyDraft("");
+    setBalanceAccountTokenDraft("");
   };
 
   const saveBalanceProvider = async () => {
@@ -1025,6 +1149,7 @@ function App() {
       const saved = await invoke<BalanceProviderConfig>("set_balance_provider", {
         config: balanceDraft,
         apiKey: balanceApiKeyDraft.trim() ? balanceApiKeyDraft.trim() : null,
+        accountToken: balanceAccountTokenDraft.trim() ? balanceAccountTokenDraft.trim() : null,
       });
       setBalanceProvider(saved);
       setBalanceDraft(saved);
@@ -1055,8 +1180,24 @@ function App() {
     }
   };
 
+  const openBalanceDetails = async () => {
+    if (!isTauri) return;
+    setBalanceDetailsOpen(true);
+    setLoadingBalanceDetails(true);
+    setBalanceDetailsError(null);
+    try {
+      const details = await invoke<BalanceDetailsSnapshot>("fetch_balance_details");
+      setBalanceDetails(details);
+    } catch (error) {
+      setBalanceDetails(null);
+      setBalanceDetailsError(String(error));
+    } finally {
+      setLoadingBalanceDetails(false);
+    }
+  };
+
   const beginWindowDrag = (event: React.MouseEvent<HTMLElement>) => {
-    if (!isTauri || event.button !== 0 || settingsOpen) return;
+    if (!isTauri || event.button !== 0 || event.detail > 1 || settingsOpen) return;
 
     const target = event.target as HTMLElement;
     if (target.closest("button, input, a, [role='button']")) return;
@@ -1116,8 +1257,24 @@ function App() {
     setAwake(true);
   };
 
+  const collapseWidget = () => {
+    if (collapseTimer.current !== null) {
+      window.clearTimeout(collapseTimer.current);
+      collapseTimer.current = null;
+    }
+    setSettingsOpen(false);
+    setAwake(false);
+  };
+
+  const handlePanelDoubleClick = (event: React.MouseEvent<HTMLElement>) => {
+    if (!awake || settingsOpen || (event.target as HTMLElement).closest("button, input, a, [role='button']")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    collapseWidget();
+  };
+
   const restWidget = () => {
-    if (settingsOpen || dropState.phase !== "idle") return;
+    if (!settings.autoCollapseEnabled || settingsOpen || dropState.phase !== "idle") return;
     if (collapseTimer.current !== null) return;
     collapseTimer.current = window.setTimeout(() => {
       setAwake(false);
@@ -1126,7 +1283,7 @@ function App() {
   };
 
   useEffect(() => {
-    if (!isTauri) return;
+    if (!isTauri || !settings.autoCollapseEnabled) return;
     let busy = false;
 
     const checkPointer = async () => {
@@ -1158,6 +1315,8 @@ function App() {
           }
           if (awake) restWidget();
         }
+      } catch {
+        // cursorPosition may fail on some Wayland compositors; rely on idle timeout below
       } finally {
         busy = false;
       }
@@ -1166,7 +1325,30 @@ function App() {
     const timer = window.setInterval(() => void checkPointer(), 140);
     void checkPointer();
     return () => window.clearInterval(timer);
-  }, [awake, dropState.phase, settingsOpen]);
+  }, [awake, dropState.phase, settings.autoCollapseEnabled, settingsOpen]);
+
+  // Auto-collapse after idle when awake
+  useEffect(() => {
+    if (!isTauri || !settings.autoCollapseEnabled || !awake || settingsOpen) return;
+    let timer = window.setTimeout(() => {
+      if (!settingsOpen && dropState.phase === "idle") {
+        setAwake(false);
+      }
+    }, 2500);
+    const onActivity = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        if (!settingsOpen && dropState.phase === "idle") {
+          setAwake(false);
+        }
+      }, 2500);
+    };
+    document.addEventListener("mousemove", onActivity, { passive: true });
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("mousemove", onActivity);
+    };
+  }, [awake, settings.autoCollapseEnabled, settingsOpen, dropState.phase]);
 
   useEffect(() => {
     if (
@@ -1322,10 +1504,36 @@ function App() {
   const quota = pulse?.quota;
   const remaining = Math.round(quota?.primary.remainingPercent ?? 0);
   const accentClass = remaining <= 10 ? "danger" : remaining <= 25 ? "warning" : "healthy";
-  const historyData = (pulse?.history ?? []).map((point) => ({
-    label: new Date(point.sampledAt * 1000).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" }),
-    used: point.usedPercent,
-  }));
+  const quotaTrend = useMemo(() => buildQuotaTrend(pulse?.history ?? []), [pulse?.history]);
+
+  const formatQuotaTrendAxis = (timestamp: number) => new Date(timestamp * 1000).toLocaleString(
+    "zh-CN",
+    quotaTrend.spanSeconds <= 36 * 60 * 60
+      ? { hour: "2-digit", minute: "2-digit", hour12: false }
+      : { month: "numeric", day: "numeric" },
+  );
+
+  const formatQuotaTrendTooltip = (timestamp: number) => new Date(timestamp * 1000).toLocaleString(
+    "zh-CN",
+    { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false },
+  );
+
+  const balanceDetailChartData = useMemo(() => {
+    if (!balanceDetails) return [];
+    let cumulative = Math.max(
+      0,
+      Number(balanceDetails.historicalUsage) - Number(balanceDetails.recentUsage),
+    );
+    return balanceDetails.history.map((point) => {
+      cumulative += point.usage;
+      return {
+        label: new Date(point.timestamp * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }),
+        usage: point.usage,
+        cumulative,
+        requests: point.requests,
+      };
+    });
+  }, [balanceDetails]);
   const weatherVisualMode: WeatherVisualMode = settings.weatherEnabled ? settings.weatherVisualMode : "off";
   const visualWeather = weatherVisualMode === "off" ? null : weather;
   const weatherIntensity = weatherVisualMode === "immersive" ? 1 : weatherVisualMode === "subtle" ? 0.42 : 0;
@@ -1376,7 +1584,13 @@ function App() {
           count={dropState.paths.length}
           message={dropState.message}
           onMouseDown={beginWindowDrag}
-          onWake={wakeWidget}
+          onWake={() => {
+            if (awake) {
+              setAwake(false);
+            } else {
+              wakeWidget();
+            }
+          }}
           onContextMenu={handleBlackHoleContextMenu}
           weather={visualWeather}
           weatherIntensity={weatherIntensity}
@@ -1392,6 +1606,7 @@ function App() {
       <main className="app compact-shell" data-theme={weather?.isDay === false ? "night" : "day"}>
         {dropState.phase !== "idle" && (
           <div className={`drop-overlay compact-drop-overlay drop-overlay-${dropState.phase}`}>
+            {dropState.phase === "ready" && <DropTargetGuide target={dropState.target} />}
             <BlackHoleCore
               phase={dropState.phase}
               count={dropState.paths.length}
@@ -1401,12 +1616,13 @@ function App() {
               recycledCount={ecosystemStats.totalRecycled}
               {...terrainProps}
             />
-            <p>{dropState.phase === "ready" ? "释放后移入系统回收站" : dropState.message}</p>
+            <p>{dropState.message}</p>
           </div>
         )}
         <div
           className="compact-card"
           onMouseDown={beginWindowDrag}
+          onDoubleClick={handlePanelDoubleClick}
         >
           <div className="compact-time">
             <strong>{now.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })}</strong>
@@ -1430,27 +1646,78 @@ function App() {
 
   return (
     <main className={`app ${settings.size}`} data-theme={weather?.isDay === false ? "night" : "day"}>
+      {dropState.phase !== "idle" && (
+        <div className={`drop-overlay drop-overlay-${dropState.phase}`}>
+          {dropState.phase === "ready" && <DropTargetGuide target={dropState.target} />}
+          <BlackHoleCore
+            phase={dropState.phase}
+            count={dropState.paths.length}
+            message={dropState.message}
+            weather={visualWeather}
+            weatherIntensity={weatherIntensity}
+            recycledCount={ecosystemStats.totalRecycled}
+            {...terrainProps}
+          />
+          <p>{dropState.message}</p>
+        </div>
+      )}
+
+      {balanceDetailsOpen && (
+        <div className="balance-detail-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) setBalanceDetailsOpen(false); }}>
+          <section className="balance-detail-panel" onMouseDown={(event) => event.stopPropagation()}>
+            <header className="balance-detail-title">
+              <div><strong>账户用量详情</strong><span>最近 24 小时 · New API</span></div>
+              <button className="icon-button" onClick={() => setBalanceDetailsOpen(false)} title="关闭"><X size={16} /></button>
+            </header>
+            {loadingBalanceDetails ? (
+              <div className="balance-detail-state"><RefreshCw className="spin" size={20} /><span>正在读取账户用量</span></div>
+            ) : balanceDetailsError ? (
+              <div className="balance-detail-state error"><strong>无法读取账户详情</strong><span>{balanceDetailsError}</span><small>请在余额设置中填写 New API 个人资料里的账户访问令牌（PAT）；旧版中转站还需填写数字用户 ID。</small></div>
+            ) : balanceDetails ? (
+              <>
+                <div className="balance-detail-layout">
+                  <div className="balance-detail-metrics">
+                    {[
+                      { key: "usage", title: "近 24 小时消耗", value: balanceDetails.recentUsage, color: "#ffbd65" },
+                      { key: "cumulative", title: "历史使用情况", value: balanceDetails.historicalUsage, color: "#dce7e2" },
+                      { key: "requests", title: "请求计数", value: balanceDetails.requestCount.toLocaleString("zh-CN"), color: "#68e3b5" },
+                    ].map((metric) => (
+                      <article className="balance-detail-metric" key={metric.key}>
+                        <span>{metric.title}</span>
+                        <strong>{metric.key === "requests" ? metric.value : `${metric.value} ${balanceDetails.currency}`}</strong>
+                        <div className="balance-detail-chart">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <AreaChart data={balanceDetailChartData} margin={{ top: 6, right: 2, bottom: 0, left: 2 }}>
+                              <Area type="monotone" dataKey={metric.key} stroke={metric.color} strokeWidth={2} fill={metric.color} fillOpacity={0.08} isAnimationActive={false} />
+                              <Tooltip contentStyle={{ background: "#101817", border: "1px solid rgba(255,255,255,.1)", borderRadius: 8, fontSize: 9 }} labelStyle={{ color: "#829089" }} />
+                            </AreaChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                  <aside className="balance-detail-remaining">
+                    <span>剩余额度</span>
+                    <i><b />正常</i>
+                    <strong>{balanceDetails.remainingBalance}</strong>
+                    <small>{balanceDetails.currency}</small>
+                    <p>双击余额卡可随时刷新此面板</p>
+                  </aside>
+                </div>
+                <div className="balance-detail-foot"><span>数据来自账户 PAT，只读访问</span><button onClick={() => void openBalanceDetails()} disabled={loadingBalanceDetails}><RefreshCw size={12} />刷新</button></div>
+              </>
+            ) : null}
+          </section>
+        </div>
+      )}
+
       <section
         className="widget"
         onMouseDown={beginWindowDrag}
+        onDoubleClick={handlePanelDoubleClick}
       >
         <div className="ambient ambient-one" />
         <div className="ambient ambient-two" />
-
-        {dropState.phase !== "idle" && (
-          <div className={`drop-overlay drop-overlay-${dropState.phase}`}>
-            <BlackHoleCore
-              phase={dropState.phase}
-              count={dropState.paths.length}
-              message={dropState.message}
-              weather={visualWeather}
-              weatherIntensity={weatherIntensity}
-              recycledCount={ecosystemStats.totalRecycled}
-              {...terrainProps}
-            />
-            <p>{dropState.phase === "ready" ? "松开鼠标后仍可从系统回收站恢复" : dropState.message}</p>
-          </div>
-        )}
 
         <header className="topbar">
           <div className="brand">
@@ -1492,7 +1759,17 @@ function App() {
         )}
 
         {balanceProvider?.enabled && (
-          <section className="balance-card">
+          <section
+            className="balance-card"
+            title="双击查看近 24 小时账户用量"
+            role="button"
+            tabIndex={0}
+            onKeyDown={(event) => { if (event.key === "Enter") void openBalanceDetails(); }}
+            onDoubleClick={(event) => {
+              event.stopPropagation();
+              if (!(event.target as HTMLElement).closest("button")) void openBalanceDetails();
+            }}
+          >
             <div className="balance-card-head">
               <span><i className="status-light" /> BALANCE</span>
               <button className="text-button" onClick={loadBalance} disabled={loadingBalance}><RefreshCw size={12} className={loadingBalance ? "spin" : ""} />刷新</button>
@@ -1503,8 +1780,8 @@ function App() {
             </div>
             {balance && (balance.grantedBalance || balance.toppedUpBalance) && (
               <div className="balance-sub">
-                {balance.grantedBalance && <span>赠送 {balance.grantedBalance}</span>}
-                {balance.toppedUpBalance && <span>充值 {balance.toppedUpBalance}</span>}
+                {balance.grantedBalance && <span>{balanceProvider?.preset === "openai-compatible" ? "总额度" : "赠送"} {balance.grantedBalance}</span>}
+                {balance.toppedUpBalance && <span>{balanceProvider?.preset === "openai-compatible" ? "已使用" : "充值"} {balance.toppedUpBalance}</span>}
               </div>
             )}
             {balanceError && <small className="balance-error">{balanceError}</small>}
@@ -1538,14 +1815,20 @@ function App() {
         {settings.size === "expanded" && (
           <section className="expanded-grid">
             <div className="panel trend-panel">
-              <div className="panel-title"><span>额度趋势</span><small>最近本地采样</small></div>
-              <ResponsiveContainer width="100%" height={152}>
-                <AreaChart data={historyData} margin={{ top: 8, right: 4, left: 0, bottom: 0 }}>
+              <div className="panel-title"><span>Codex 额度使用趋势</span><small>当前 7 天周期 · 本地采样</small></div>
+              <ResponsiveContainer width="100%" height={136}>
+                <AreaChart data={quotaTrend.data} margin={{ top: 12, right: 4, left: 0, bottom: 0 }}>
                   <defs><linearGradient id="quotaFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#68e3b5" stopOpacity={0.34}/><stop offset="1" stopColor="#68e3b5" stopOpacity={0}/></linearGradient></defs>
                   <CartesianGrid stroke="rgba(255,255,255,.05)" vertical={false} />
-                  <XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: "#748078", fontSize: 10 }} />
-                  <Tooltip contentStyle={{ background: "#111a19", border: "1px solid rgba(255,255,255,.1)", borderRadius: 10 }} formatter={(value) => [`${value}%`, "已使用"]} />
-                  <Area type="monotone" dataKey="used" stroke="#68e3b5" strokeWidth={2} fill="url(#quotaFill)" />
+                  <XAxis dataKey="sampledAt" type="number" domain={['dataMin', 'dataMax']} tickCount={6} minTickGap={24} axisLine={false} tickLine={false} tick={{ fill: "#748078", fontSize: 10 }} tickFormatter={formatQuotaTrendAxis} />
+                  <YAxis hide domain={[0, 100]} />
+                  <Tooltip cursor={{ stroke: "rgba(255,255,255,.22)", strokeWidth: 1 }} content={({ active, payload }) => {
+                    const point = payload?.[0]?.payload as { sampledAt?: number; used?: number } | undefined;
+                    if (!active || point?.sampledAt == null || point.used == null) return null;
+                    return <div className="quota-trend-tooltip"><span>{formatQuotaTrendTooltip(point.sampledAt)}</span><strong>已使用：{point.used.toFixed(1)}%</strong></div>;
+                  }} />
+                  {quotaTrend.resetAt != null && <ReferenceLine x={quotaTrend.resetAt} stroke="rgba(255,210,145,.6)" strokeDasharray="3 3" label={{ value: "周期重置", position: "insideTopRight", fill: "#d3af7b", fontSize: 9 }} />}
+                  <Area type="monotone" dataKey="used" name="已使用" stroke="#68e3b5" strokeWidth={2} fill="url(#quotaFill)" dot={false} activeDot={{ r: 4 }} isAnimationActive={false} />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
@@ -1602,6 +1885,7 @@ function App() {
               </div>
               <div className="setting-row"><div><strong>始终置顶</strong><span>让组件保持在其他窗口上方</span></div><button className={`toggle ${settings.topmost ? "on" : ""}`} onClick={toggleTopmost}><i /></button></div>
               <div className="setting-row"><div><strong>开机启动</strong><span>登录系统后自动运行</span></div><button className={`toggle ${settings.autostart ? "on" : ""}`} onClick={toggleAutostart}><i /></button></div>
+              <div className="setting-row"><div><strong>自动回收</strong><span>关闭后标签以面板形式常驻，双击仍可手动收回</span></div><button className={`toggle ${settings.autoCollapseEnabled ? "on" : ""}`} onClick={toggleAutoCollapse}><i /></button></div>
               <div className="setting-row"><div><strong>天气模块</strong><span>关闭后不访问天气服务</span></div><button className={`toggle ${settings.weatherEnabled ? "on" : ""}`} onClick={() => saveSettings({ ...settings, weatherEnabled: !settings.weatherEnabled })}><i /></button></div>
               <div className="setting-group">
                 <label>天气视觉联动 <b>{settings.weatherVisualMode === "off" ? "关闭" : settings.weatherVisualMode === "subtle" ? "轻柔" : "沉浸"}</b></label>
@@ -1646,15 +1930,17 @@ function App() {
                 <label>余额查询 <b>{balanceProvider?.enabled ? "已启用" : "已关闭"}</b></label>
                 {balanceDraft ? (
                   <>
-                    <div className="setting-row"><div><strong>启用</strong><span>只填 API Key 读余额</span></div><button className={`toggle ${balanceDraft.enabled ? "on" : ""}`} onClick={() => setBalanceDraft({ ...balanceDraft, enabled: !balanceDraft.enabled })}><i /></button></div>
-                    <div className="segmented">{([["deepseek", "DeepSeek 官方"], ["openai-compatible", "中转站"]] as [BalancePreset, string][]).map(([preset, label]) => <button key={preset} className={balanceDraft.preset === preset ? "active" : ""} onClick={() => setBalanceDraft({ ...balanceDraft, preset })}>{label}</button>)}</div>
+                    <div className="setting-row"><div><strong>启用</strong><span>{balanceDraft.preset === "openai-compatible" ? "使用账户 PAT 读取真实余额" : "使用 API Key 读取官方余额"}</span></div><button className={`toggle ${balanceDraft.enabled ? "on" : ""}`} onClick={() => setBalanceDraft({ ...balanceDraft, enabled: !balanceDraft.enabled })}><i /></button></div>
+                    <div className="segmented">{([["deepseek", "DeepSeek 官方"], ["openai-compatible", "New API 中转站"]] as [BalancePreset, string][]).map(([preset, label]) => <button key={preset} className={balanceDraft.preset === preset ? "active" : ""} onClick={() => setBalanceDraft({ ...balanceDraft, preset })}>{label}</button>)}</div>
                     {balanceDraft.preset === "openai-compatible" && <div className="search-box provider-field"><input value={balanceDraft.baseUrl} onChange={(event) => setBalanceDraft({ ...balanceDraft, baseUrl: event.target.value })} placeholder="中转站地址 https://…" /></div>}
-                    <div className="search-box provider-field"><input type="password" value={balanceApiKeyDraft} onChange={(event) => setBalanceApiKeyDraft(event.target.value)} placeholder={balanceProvider?.hasApiKey ? "API Key 已存（留空不变）" : "API Key"} /></div>
+                    {balanceDraft.preset === "openai-compatible" && <div className="search-box provider-field"><input inputMode="numeric" value={balanceDraft.accountUserId} onChange={(event) => setBalanceDraft({ ...balanceDraft, accountUserId: event.target.value.replace(/\D/g, "") })} placeholder="数字用户 ID（旧版 New API 必填）" /></div>}
+                    {balanceDraft.preset === "deepseek" && <div className="search-box provider-field"><input type="password" value={balanceApiKeyDraft} onChange={(event) => setBalanceApiKeyDraft(event.target.value)} placeholder={balanceProvider?.hasApiKey ? "API Key 已存（留空不变）" : "API Key"} /></div>}
+                    {balanceDraft.preset === "openai-compatible" && <div className="search-box provider-field"><input type="password" value={balanceAccountTokenDraft} onChange={(event) => setBalanceAccountTokenDraft(event.target.value)} placeholder={balanceProvider?.hasAccountToken ? "账户访问令牌已存（留空不变）" : "账户访问令牌 PAT（用于真实账户余额）"} /></div>}
                     <div className="provider-actions">
                       <button className="provider-save" onClick={saveBalanceProvider}>保存</button>
                       <button className="provider-test" onClick={testBalanceProvider}>测试</button>
                     </div>
-                    <small className="setting-hint">DeepSeek 官方自动读 /user/balance；中转站填 base 地址后同样读 /user/balance。Key 存系统凭据库。</small>
+                    <small className="setting-hint">New API 的模型 API Key 只能读取令牌额度；真实账户余额和曲线使用个人资料中的访问令牌（PAT）。旧版中转站还需填写账户的数字用户 ID；凭据只存系统凭据库。</small>
                   </>
                 ) : (
                   <button className="text-button" onClick={openBalanceEditor}>打开配置</button>
@@ -1685,7 +1971,7 @@ function App() {
               </div>
               <div className="privacy-note"><LocateFixed size={15}/><p><strong>隐私优先</strong><span>Codex 额度只读取本机事件；天气仅发送你选择的城市坐标，不读取账号令牌。</span></p></div>
               {capabilities && <div className="capability-card liquid-glass-tag"><strong>{capabilities.desktopCapture ? "实时桌面透镜" : "安全降级模式"}</strong><span>{capabilities.platform} · {capabilities.session}{capabilities.fallbackReason ? ` · ${capabilities.fallbackReason}` : " · 当前显示器独立采样"}</span></div>}
-              <div className="settings-version">CODEX COSMOS 1.0.2 · RUGGED DESKTOP</div>
+              <div className="settings-version">CODEX COSMOS 1.1.0 · RUGGED DESKTOP</div>
             </aside>
           </div>
         )}

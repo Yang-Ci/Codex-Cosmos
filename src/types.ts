@@ -31,6 +31,7 @@ export interface QuotaHistoryPoint {
   sampledAt: number;
   usedPercent: number;
   windowMinutes: number;
+  resetsAt?: number;
 }
 
 export interface MonthlyEstimate {
@@ -133,6 +134,7 @@ export interface Settings {
   quoteCategory: "mixed" | "tech" | "philosophy";
   weatherEnabled: boolean;
   weatherVisualMode: WeatherVisualMode;
+  autoCollapseEnabled: boolean;
   idleDriftEnabled: boolean;
   terrainMode: TerrainMode;
   terrainIntensity: number;
@@ -181,8 +183,10 @@ export interface BalanceProviderConfig {
   name: string;
   preset: BalancePreset;
   baseUrl: string;
+  accountUserId: string;
   refreshMinutes: number;
   hasApiKey?: boolean | null;
+  hasAccountToken?: boolean | null;
 }
 
 export interface BalanceSnapshot {
@@ -191,5 +195,21 @@ export interface BalanceSnapshot {
   grantedBalance: string;
   toppedUpBalance: string;
   source: string;
+  sampledAt: string;
+}
+
+export interface BalanceHistoryPoint {
+  timestamp: number;
+  usage: number;
+  requests: number;
+}
+
+export interface BalanceDetailsSnapshot {
+  remainingBalance: string;
+  recentUsage: string;
+  historicalUsage: string;
+  requestCount: number;
+  currency: string;
+  history: BalanceHistoryPoint[];
   sampledAt: string;
 }

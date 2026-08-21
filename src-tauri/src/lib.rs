@@ -22,6 +22,33 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+#[tauri::command]
+fn set_widget_size(
+    window: tauri::WebviewWindow,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    use tauri::{LogicalSize, LogicalUnit, WindowSizeConstraints};
+
+    window
+        .set_size_constraints(WindowSizeConstraints::default())
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size(LogicalSize::new(width as f64, height as f64))
+        .map_err(|error| error.to_string())?;
+    let width = LogicalUnit::new(width as f64).into();
+    let height = LogicalUnit::new(height as f64).into();
+    window
+        .set_size_constraints(WindowSizeConstraints {
+            min_width: Some(width),
+            min_height: Some(height),
+            max_width: Some(width),
+            max_height: Some(height),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -94,6 +121,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_pulse_data,
             quit_app,
+            set_widget_size,
             recycle::move_to_trash,
             recycle::recent_recycles,
             recycle::restore_last_recycle,
@@ -112,7 +140,8 @@ pub fn run() {
             usage::fetch_custom_usage,
             balance::get_balance_provider,
             balance::set_balance_provider,
-            balance::fetch_balance_snapshot
+            balance::fetch_balance_snapshot,
+            balance::fetch_balance_details
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Cosmos");

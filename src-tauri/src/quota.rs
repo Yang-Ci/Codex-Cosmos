@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 const MAX_SESSION_FILES: usize = 50;
 const MAX_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const HISTORY_DAYS: i64 = 45;
+const RESET_TIME_TOLERANCE_SECONDS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,7 +281,7 @@ fn record_sample(history: &mut Vec<QuotaHistoryPoint>, event: &CandidateEvent) {
     let should_append = history.last().map_or(true, |previous| {
         point.sampled_at - previous.sampled_at >= 15 * 60
             || (point.used_percent - previous.used_percent).abs() >= 0.1
-            || point.resets_at != previous.resets_at
+            || !same_quota_cycle(previous, &point)
     });
     if should_append {
         history.push(point);
@@ -290,6 +291,16 @@ fn record_sample(history: &mut Vec<QuotaHistoryPoint>, event: &CandidateEvent) {
     if history.len() > 2_000 {
         history.drain(0..history.len() - 2_000);
     }
+}
+
+fn same_quota_cycle(left: &QuotaHistoryPoint, right: &QuotaHistoryPoint) -> bool {
+    if left.window_minutes != right.window_minutes {
+        return false;
+    }
+    if left.resets_at <= 0 || right.resets_at <= 0 {
+        return left.resets_at == right.resets_at;
+    }
+    left.resets_at.abs_diff(right.resets_at) <= RESET_TIME_TOLERANCE_SECONDS
 }
 
 fn estimate_monthly_usage(history: &[QuotaHistoryPoint]) -> MonthlyEstimate {
@@ -303,13 +314,16 @@ fn estimate_monthly_usage(history: &[QuotaHistoryPoint]) -> MonthlyEstimate {
     }
 
     let mut consumption = 0.0;
+    let mut cycle_peak = history[0].used_percent.max(0.0);
     for pair in history.windows(2) {
         let previous = &pair[0];
         let current = &pair[1];
-        if current.resets_at != previous.resets_at || current.used_percent + 0.5 < previous.used_percent {
+        if !same_quota_cycle(previous, current) {
             consumption += current.used_percent.max(0.0);
-        } else {
-            consumption += (current.used_percent - previous.used_percent).max(0.0);
+            cycle_peak = current.used_percent.max(0.0);
+        } else if current.used_percent > cycle_peak {
+            consumption += current.used_percent - cycle_peak;
+            cycle_peak = current.used_percent;
         }
     }
 
@@ -356,5 +370,25 @@ mod tests {
         let estimate = estimate_monthly_usage(&history);
         assert_eq!(estimate.samples, 3);
         assert!(estimate.used_percent > 0.0);
+    }
+
+    #[test]
+    fn treats_reset_time_jitter_as_the_same_cycle() {
+        let left = QuotaHistoryPoint { sampled_at: 1_000_000, used_percent: 47.0, window_minutes: 10080, resets_at: 2_000_000 };
+        let right = QuotaHistoryPoint { sampled_at: 1_000_060, used_percent: 47.0, window_minutes: 10080, resets_at: 2_000_119 };
+        assert!(same_quota_cycle(&left, &right));
+    }
+
+    #[test]
+    fn monthly_estimate_ignores_same_cycle_regressions_and_rebounds() {
+        let day = 86_400;
+        let history = vec![
+            QuotaHistoryPoint { sampled_at: 1_000_000, used_percent: 40.0, window_minutes: 10080, resets_at: 2_000_000 },
+            QuotaHistoryPoint { sampled_at: 1_000_000 + day, used_percent: 47.0, window_minutes: 10080, resets_at: 2_000_060 },
+            QuotaHistoryPoint { sampled_at: 1_000_000 + day * 2, used_percent: 39.0, window_minutes: 10080, resets_at: 1_999_940 },
+            QuotaHistoryPoint { sampled_at: 1_000_000 + day * 3, used_percent: 49.0, window_minutes: 10080, resets_at: 2_000_030 },
+        ];
+        let estimate = estimate_monthly_usage(&history);
+        assert!((estimate.used_percent - 90.0).abs() < f64::EPSILON);
     }
 }
