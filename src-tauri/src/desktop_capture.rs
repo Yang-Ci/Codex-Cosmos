@@ -190,14 +190,36 @@ fn capture_windows(
 
 #[cfg(target_os = "windows")]
 pub fn exclude_window_from_capture(window: &tauri::WebviewWindow) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
-    };
-
-    if let Ok(hwnd) = window.hwnd() {
-        let _ = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
-    }
+    let _ = apply_capture_exclusion(window, true);
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn exclude_window_from_capture(_window: &tauri::WebviewWindow) {}
+
+/// 前端按设置动态开关窗口截图隔离：true 排除（黑洞透镜采到真实桌面），
+/// false 恢复正常可被截图与录屏，但透镜会显示自身界面。
+#[tauri::command]
+pub fn set_window_capture_exclusion(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到桌面组件窗口".to_string())?;
+    apply_capture_exclusion(&window, enabled)
+}
+
+#[cfg(target_os = "windows")]
+fn apply_capture_exclusion(window: &tauri::WebviewWindow, enabled: bool) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    };
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("无法读取窗口句柄：{error}"))?;
+    let affinity = if enabled { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    unsafe { SetWindowDisplayAffinity(hwnd, affinity) }
+        .map_err(|error| format!("无法更新窗口截图隔离：{error}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_capture_exclusion(_window: &tauri::WebviewWindow, _enabled: bool) -> Result<(), String> {
+    Ok(())
+}

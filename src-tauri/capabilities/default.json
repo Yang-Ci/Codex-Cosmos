@@ -16,6 +16,7 @@
     "core:window:allow-start-dragging",
     "autostart:default",
     "notification:default",
-    "opener:default"
+    "opener:default",
+    "dialog:default"
   ]
 }

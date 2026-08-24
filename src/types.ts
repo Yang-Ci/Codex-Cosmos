@@ -90,11 +90,31 @@ export interface EffectCapabilities {
   fallbackReason?: string | null;
 }
 
+export type FocusPhase = "focus" | "break";
+
+export interface FocusHistoryEntry {
+  at: number;
+  phase: FocusPhase;
+  minutes: number;
+}
+
 export interface FocusSession {
   durationMinutes: number;
+  breakMinutes: number;
+  longBreakMinutes: number;
+  cyclesBeforeLongBreak: number;
+  autoChain: boolean;
+  phase: FocusPhase;
   remainingSeconds: number;
   running: boolean;
   endsAt: number | null;
+  cycleIndex: number;
+  totalFocusSeconds: number;
+  todayFocusSeconds: number;
+  todayDate: string;
+  completedCount: number;
+  history: FocusHistoryEntry[];
+  completedAt: number | null;
 }
 
 export interface WeatherLocation {
@@ -129,12 +149,14 @@ export interface Settings {
   location: WeatherLocation;
   size: WidgetSize;
   topmost: boolean;
+  excludeFromCapture: boolean;
   autostart: boolean;
   locale: "zh-CN" | "en-US";
   quoteCategory: "mixed" | "tech" | "philosophy";
   weatherEnabled: boolean;
   weatherVisualMode: WeatherVisualMode;
   autoCollapseEnabled: boolean;
+  swirlEnabled: boolean;
   idleDriftEnabled: boolean;
   terrainMode: TerrainMode;
   terrainIntensity: number;
@@ -212,4 +234,71 @@ export interface BalanceDetailsSnapshot {
   currency: string;
   history: BalanceHistoryPoint[];
   sampledAt: string;
+}
+
+// ─── 剪贴板流星 (Clipboard Meteor) ─────────────────────────────────────
+// 本机剪贴板变化的瞬时提示 + 会话内历史记录（内存，不落盘）。
+
+export interface ClipboardEntry {
+  id: number;
+  text: string;
+  copiedAt: number;
+}
+
+// ─── 星际通讯站 (Cosmos Relay) ──────────────────────────────────────────
+// 局域网投递，接收端 MVP；协议对齐 LocalSend v2。
+
+export interface RelayConfig {
+  enabled: boolean;
+  port: number;
+  alias: string;
+  destination: string;
+  autoAccept: boolean;
+  fingerprint: string;
+}
+
+export interface RelayDeviceInfo {
+  alias: string;
+  version: string;
+  fingerprint: string;
+  port: number;
+  protocol: string;
+  deviceModel: string;
+  deviceType: string;
+  download: boolean;
+}
+
+export interface RelayRecentRecord {
+  filename: string;
+  bytes: number;
+  sender: string;
+  receivedAt: number;
+  destination: string;
+}
+
+export interface RelayStats {
+  totalReceived: number;
+  totalBytes: number;
+  recent: RelayRecentRecord[];
+}
+
+export interface RelayTransferProgress {
+  token: string;
+  filename: string;
+  received: number;
+  total: number;
+}
+
+export interface RelayTransferComplete {
+  token: string;
+  filename: string;
+  bytes: number;
+  sender: string;
+  destination: string;
+}
+
+export interface RelayStatusEvent {
+  running: boolean;
+  port: number;
+  error?: string | null;
 }

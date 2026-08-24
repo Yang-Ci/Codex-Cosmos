@@ -1,9 +1,10 @@
+mod balance;
 mod desktop_capture;
 mod ecosystem;
 mod quota;
 mod recycle;
+mod relay;
 mod usage;
-mod balance;
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -49,6 +50,40 @@ fn set_widget_size(
     Ok(())
 }
 
+/// Reposition + resize the widget in one call, keeping the window centered on its
+/// previous center so collapsing/expanding does not snap the black hole to the corner.
+#[tauri::command]
+fn set_widget_rect(
+    window: tauri::WebviewWindow,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    use tauri::{LogicalPosition, LogicalSize, LogicalUnit, WindowSizeConstraints};
+
+    window
+        .set_position(LogicalPosition::new(x as f64, y as f64))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size_constraints(WindowSizeConstraints::default())
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size(LogicalSize::new(width as f64, height as f64))
+        .map_err(|error| error.to_string())?;
+    let width = LogicalUnit::new(width as f64).into();
+    let height = LogicalUnit::new(height as f64).into();
+    window
+        .set_size_constraints(WindowSizeConstraints {
+            min_width: Some(width),
+            min_height: Some(height),
+            max_width: Some(width),
+            max_height: Some(height),
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -61,6 +96,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec!["--autostart"]),
@@ -68,6 +104,11 @@ pub fn run() {
         .setup(|app| {
             app.manage(recycle::RecycleState::load(app.handle()));
             app.manage(ecosystem::EcosystemState::load(app.handle()));
+            let relay_state = relay::RelayState::load(app.handle());
+            app.manage(relay_state);
+            // 启动时若已启用星际通讯站则拉起后台发现与 HTTP 服务。
+            let relay_state = app.state::<relay::RelayState>();
+            relay::start(app.handle().clone(), &relay_state);
             let show = MenuItem::with_id(app, "show", "显示 Codex Cosmos", true, None::<&str>)?;
             let refresh = MenuItem::with_id(app, "refresh", "刷新额度", true, None::<&str>)?;
             let recycle_bin = MenuItem::with_id(app, "recycle-bin", "打开回收站", true, None::<&str>)?;
@@ -122,12 +163,14 @@ pub fn run() {
             get_pulse_data,
             quit_app,
             set_widget_size,
+            set_widget_rect,
             recycle::move_to_trash,
             recycle::recent_recycles,
             recycle::restore_last_recycle,
             recycle::open_recycle_bin,
             desktop_capture::capture_desktop_under_widget,
             desktop_capture::effect_capabilities,
+            desktop_capture::set_window_capture_exclusion,
             ecosystem::ecosystem_stats,
             ecosystem::set_wormhole_destination,
             ecosystem::set_forge_destination,
@@ -141,7 +184,13 @@ pub fn run() {
             balance::get_balance_provider,
             balance::set_balance_provider,
             balance::fetch_balance_snapshot,
-            balance::fetch_balance_details
+            balance::fetch_balance_details,
+            relay::get_relay_config,
+            relay::set_relay_config,
+            relay::relay_devices,
+            relay::relay_stats,
+            relay::relay_recent,
+            relay::clear_relay_recent
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Cosmos");

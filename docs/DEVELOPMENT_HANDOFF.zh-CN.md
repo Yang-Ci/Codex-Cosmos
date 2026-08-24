@@ -13,7 +13,7 @@
 - Rust：stable，Windows 目标为 MSVC
 - 主要平台：Windows 10/11、Linux X11；Wayland 使用降级策略
 
-V1.0 已具备额度、天气、每日一言、桌面组件三种尺寸、托盘、开机启动、黑洞回收、虫洞移动、ZIP 星炉、剪贴板彗星、专注月球、边缘巡游、七种桌面模式与 GPU 局部扭曲。
+V1.0 已具备额度、天气、每日一言、桌面组件三种尺寸、托盘、开机启动、黑洞回收、虫洞移动、ZIP 星炉、剪贴板流星（C 打开历史面板）、专注月球、边缘巡游、七种桌面模式与 GPU 局部扭曲。
 
 ## 2. 先在新电脑跑起来
 
@@ -53,7 +53,7 @@ pnpm tauri dev
 React / TypeScript
   App.tsx                 全局状态、窗口形态、拖放路由、设置与 UI
   BlackHoleCanvas.tsx     WebGPU/WGSL 渲染、背景采样、降级
-  DesktopEcosystem.tsx    虫洞、星炉、彗星、月球等桌面生态层
+  DesktopEcosystem.tsx    虫洞、星炉、流星、月球等桌面生态层
   weather.ts / quotes.ts  外部天气与离线内容
            │ Tauri invoke / event
 Rust

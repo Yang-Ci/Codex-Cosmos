@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri as detectTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { playChime, resumeAudio } from "./focusAudio";
 import {
   currentMonitor,
   cursorPosition,
@@ -13,6 +14,7 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   Bell,
   CalendarDays,
@@ -62,15 +64,19 @@ import { quoteOfTheDay } from "./quotes";
 import { describeWeather, fetchWeather, searchLocations } from "./weather";
 import { BlackHoleCanvas } from "./BlackHoleCanvas";
 import { DesktopEcosystem } from "./DesktopEcosystem";
+import { RelayPanel } from "./RelayPanel";
 import type {
   BalanceDetailsSnapshot,
   BalancePreset,
   BalanceProviderConfig,
   BalanceSnapshot,
+  ClipboardEntry,
   DropPhase,
   EffectCapabilities,
   EffectQuality,
   EcosystemStats,
+  FocusHistoryEntry,
+  FocusPhase,
   FocusSession,
   ForgeResult,
   PulseData,
@@ -164,12 +170,14 @@ const defaultSettings: Settings = {
   location: defaultLocation,
   size: "standard",
   topmost: true,
+  excludeFromCapture: true,
   autostart: false,
   locale: "zh-CN",
   quoteCategory: "mixed",
   weatherEnabled: true,
   weatherVisualMode: "immersive",
   autoCollapseEnabled: true,
+  swirlEnabled: true,
   idleDriftEnabled: true,
   terrainMode: "gravity",
   terrainIntensity: 65,
@@ -209,7 +217,9 @@ const sizeMap: Record<WidgetSize, { width: number; height: number }> = {
 };
 
 const idleSize = { width: 184, height: 164 };
+const clipboardPanelSize = { width: 320, height: 400 };
 const quotaResetToleranceSeconds = 5 * 60;
+const CLIPBOARD_HISTORY_LIMIT = 30;
 
 function buildQuotaTrend(history: PulseData["history"]) {
   const sorted = [...history].sort((left, right) => left.sampledAt - right.sampledAt);
@@ -265,6 +275,35 @@ function randomWormholeExit(previous?: { x: number; y: number; angle: number }) 
   return choices[Math.floor(Math.random() * choices.length)] ?? wormholeExitPoints[0];
 }
 
+// Discrete touchdown spots for the clipboard meteor, spread across the upper-left
+// periphery (top edge + left edge) so they stay clear of the focus-moon,
+// wormhole, star-forge, and growth-orbit that occupy the center and corners.
+const meteorLandingPoints = [
+  { x: 4, y: 4 },
+  { x: 22, y: 2 },
+  { x: 40, y: 8 },
+  { x: 58, y: 3 },
+  { x: 76, y: 10 },
+  { x: 94, y: 4 },
+  { x: 112, y: 12 },
+  { x: 4, y: 40 },
+  { x: 16, y: 62 },
+  { x: 3, y: 82 },
+];
+
+/** Maps a meteor's coordinates back to its index in meteorLandingPoints (or -1). */
+function meteorLandingIndex(point: { x: number; y: number }): number {
+  return meteorLandingPoints.findIndex((p) => p.x === point.x && p.y === point.y);
+}
+
+/** Landing slot for a new meteor, excluding slots currently occupied by visible meteors. */
+function nextMeteorLanding(visible: { x: number; y: number }[]) {
+  const occupied = new Set(visible.map(meteorLandingIndex).filter((i) => i >= 0));
+  const pool = meteorLandingPoints.map((_, index) => index).filter((index) => !occupied.has(index));
+  const index = pool.length ? pool[Math.floor(Math.random() * pool.length)] : 0;
+  return meteorLandingPoints[index];
+}
+
 const defaultEcosystemStats: EcosystemStats = {
   totalRecycled: 0,
   totalWormholeMoves: 0,
@@ -273,19 +312,120 @@ const defaultEcosystemStats: EcosystemStats = {
   forgeDestination: "Downloads",
 };
 
-function loadFocusSession(): FocusSession {
-  const fallback: FocusSession = { durationMinutes: 25, remainingSeconds: 1500, running: false, endsAt: null };
-  try {
-    const saved = JSON.parse(readStoredValue("focus") ?? "null") as FocusSession | null;
-    if (!saved) return fallback;
-    if (saved.running && saved.endsAt) {
-      const remainingSeconds = Math.max(0, Math.ceil((saved.endsAt - Date.now()) / 1000));
-      return { ...saved, remainingSeconds, running: remainingSeconds > 0 };
-    }
-    return { ...fallback, ...saved };
-  } catch {
-    return fallback;
+function todayStamp(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+const defaultFocusSession: FocusSession = {
+  durationMinutes: 25,
+  breakMinutes: 5,
+  longBreakMinutes: 15,
+  cyclesBeforeLongBreak: 4,
+  autoChain: true,
+  phase: "focus",
+  remainingSeconds: 1500,
+  running: false,
+  endsAt: null,
+  cycleIndex: 0,
+  totalFocusSeconds: 0,
+  todayFocusSeconds: 0,
+  todayDate: todayStamp(),
+  completedCount: 0,
+  history: [],
+  completedAt: null,
+};
+
+/** Full seconds for the current phase of `s` (focus duration or the matching break length). */
+function phaseSeconds(s: FocusSession): number {
+  if (s.phase === "focus") return s.durationMinutes * 60;
+  const long = s.cycleIndex % Math.max(1, s.cyclesBeforeLongBreak) === 0;
+  return (long ? s.longBreakMinutes : s.breakMinutes) * 60;
+}
+
+/**
+ * Pure transition: the current phase just ended. Records focus stats + history,
+ * advances to the next phase, and — when `autoChain` is on — immediately starts it.
+ */
+function completePhase(current: FocusSession, autoChain: boolean): FocusSession {
+  const now = Date.now();
+  const today = todayStamp();
+  const rolledOver = today !== current.todayDate;
+  const phaseSec = phaseSeconds(current);
+  const history: FocusHistoryEntry[] = [
+    { at: now, phase: current.phase, minutes: Math.round(phaseSec / 60) },
+    ...current.history,
+  ].slice(0, 30);
+
+  if (current.phase === "focus") {
+    const focusSeconds = current.durationMinutes * 60;
+    const nextCycle = current.cycleIndex + 1;
+    const long = nextCycle % Math.max(1, current.cyclesBeforeLongBreak) === 0;
+    const breakSec = (long ? current.longBreakMinutes : current.breakMinutes) * 60;
+    return {
+      ...current,
+      completedAt: now,
+      todayDate: today,
+      autoChain,
+      history,
+      totalFocusSeconds: current.totalFocusSeconds + focusSeconds,
+      todayFocusSeconds: (rolledOver ? 0 : current.todayFocusSeconds) + focusSeconds,
+      completedCount: current.completedCount + 1,
+      cycleIndex: nextCycle,
+      phase: "break",
+      remainingSeconds: breakSec,
+      running: autoChain,
+      endsAt: autoChain ? now + breakSec * 1000 : null,
+    };
   }
+
+  // break just ended -> next focus
+  const focusSec = current.durationMinutes * 60;
+  return {
+    ...current,
+    completedAt: now,
+    todayDate: today,
+    autoChain,
+    history,
+    phase: "focus",
+    remainingSeconds: focusSec,
+    running: autoChain,
+    endsAt: autoChain ? now + focusSec * 1000 : null,
+  };
+}
+
+function loadFocusSession(): FocusSession {
+  const today = todayStamp();
+  try {
+    const saved = JSON.parse(readStoredValue("focus") ?? "null") as Partial<FocusSession> | null;
+    if (!saved) return { ...defaultFocusSession, todayDate: today };
+    const rolledOver = (saved.todayDate ?? today) !== today;
+    const merged: FocusSession = {
+      ...defaultFocusSession,
+      ...saved,
+      todayDate: today,
+      todayFocusSeconds: rolledOver ? 0 : (saved.todayFocusSeconds ?? 0),
+      history: Array.isArray(saved.history) ? saved.history.slice(0, 30) : [],
+      phase: saved.phase === "break" ? "break" : "focus",
+    };
+    if (merged.running && merged.endsAt) {
+      const remainingSeconds = Math.max(0, Math.ceil((merged.endsAt - Date.now()) / 1000));
+      merged.remainingSeconds = remainingSeconds;
+      merged.running = remainingSeconds > 0;
+      if (!merged.running) merged.endsAt = null;
+    }
+    return merged;
+  } catch {
+    return { ...defaultFocusSession, todayDate: today };
+  }
+}
+
+/** Compact relative timestamp for clipboard board entries (刚刚 / Xm前 / Xh前). */
+function formatClipboardTime(ts: number, now: number): string {
+  const diff = Math.max(0, now - ts);
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分前`;
+  return `${Math.floor(diff / 3_600_000)}时前`;
 }
 
 function loadSettings(): Settings {
@@ -516,7 +656,9 @@ function App() {
   const [recycleHistory, setRecycleHistory] = useState<RecycleBatch[]>([]);
   const [ecosystemStats, setEcosystemStats] = useState<EcosystemStats>(defaultEcosystemStats);
   const [focusSession, setFocusSession] = useState<FocusSession>(loadFocusSession);
-  const [clipboardComet, setClipboardComet] = useState<{ id: number; text: string } | null>(null);
+  const [clipboardMeteors, setClipboardMeteors] = useState<{ id: number; x: number; y: number }[]>([]);
+  const [clipboardHistory, setClipboardHistory] = useState<ClipboardEntry[]>([]);
+  const [clipboardPanelOpen, setClipboardPanelOpen] = useState(false);
   const [wormholePathDraft, setWormholePathDraft] = useState("");
   const [forgePathDraft, setForgePathDraft] = useState("");
   const [capabilities, setCapabilities] = useState<EffectCapabilities | null>(null);
@@ -555,7 +697,9 @@ function App() {
   const suppressWakeUntilLeave = useRef(false);
   const dropTargetRef = useRef<"trash" | "wormhole" | "forge">("trash");
   const lastClipboardRef = useRef<string | null>(null);
-  const cometTimer = useRef<number | null>(null);
+  const meteorsRef = useRef<{ id: number; x: number; y: number }[]>([]);
+  const meteorIdRef = useRef(0);
+  const meteorTimersRef = useRef<Set<number>>(new Set());
   const quote = useMemo(() => quoteOfTheDay(settings.quoteCategory), [settings.quoteCategory]);
 
   const saveSettings = useCallback((next: Settings) => {
@@ -582,6 +726,14 @@ function App() {
     } catch {
       setEcosystemStats(defaultEcosystemStats);
     }
+  }, []);
+
+  const prependClipboard = useCallback((text: string) => {
+    const id = Date.now();
+    setClipboardHistory((prev) => {
+      const next = [{ id, text, copiedAt: id }, ...prev.filter((entry) => entry.text !== text)];
+      return next.slice(0, CLIPBOARD_HISTORY_LIMIT);
+    });
   }, []);
 
   const clearFeedbackLater = useCallback((delay = 1800) => {
@@ -737,22 +889,44 @@ function App() {
     void invoke<EffectCapabilities>("effect_capabilities").then(setCapabilities).catch(() => setCapabilities(null));
   }, []);
 
+  // 启动与切换时按设置同步窗口截图隔离状态。
+  useEffect(() => {
+    if (!isTauri) return;
+    void invoke("set_window_capture_exclusion", { enabled: settings.excludeFromCapture }).catch(() => {});
+  }, [settings.excludeFromCapture]);
+
   useEffect(() => {
     localStorage.setItem(storageKeys.focus, JSON.stringify(focusSession));
     if (!focusSession.running || !focusSession.endsAt) return;
+    const endsAt = focusSession.endsAt;
     const timer = window.setInterval(() => {
-      setFocusSession((current) => {
-        if (!current.running || !current.endsAt) return current;
-        const remainingSeconds = Math.max(0, Math.ceil((current.endsAt - Date.now()) / 1000));
-        if (remainingSeconds === 0) {
-          void sendNotification({ title: "专注月球完成", body: `${current.durationMinutes} 分钟专注周期结束，起来活动一下。` });
-          return { ...current, remainingSeconds: 0, running: false, endsAt: null };
-        }
-        return { ...current, remainingSeconds };
+      const remaining = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+      if (remaining > 0) {
+        setFocusSession((current) => ({ ...current, remainingSeconds: remaining }));
+        return;
+      }
+      // current phase just ended -> record stats, advance (auto-chain if enabled), notify + chime
+      const next = completePhase(focusSession, focusSession.autoChain);
+      setFocusSession(next);
+      const focusDone = focusSession.phase === "focus";
+      void sendNotification({
+        title: focusDone ? "专注完成" : "休息结束",
+        body: focusDone
+          ? `${focusSession.durationMinutes} 分钟专注结束，起身放松一下。`
+          : "休息结束，开始下一轮专注。",
       });
+      playChime(focusDone ? "focus" : "break");
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [focusSession.running, focusSession.endsAt]);
+  }, [focusSession.running, focusSession.endsAt, focusSession.autoChain]);
+
+  // Unlock Web Audio on the first pointer interaction (autoplay policy).
+  useEffect(() => {
+    if (!isTauri) return;
+    const unlock = () => resumeAudio();
+    window.addEventListener("pointerdown", unlock, { once: true });
+    return () => window.removeEventListener("pointerdown", unlock);
+  }, []);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -766,14 +940,25 @@ function App() {
         }
         if (text === lastClipboardRef.current) return;
         lastClipboardRef.current = text;
-        setClipboardComet({ id: Date.now(), text });
-        if (cometTimer.current !== null) window.clearTimeout(cometTimer.current);
-        cometTimer.current = window.setTimeout(() => {
-          setClipboardComet(null);
-          cometTimer.current = null;
+        prependClipboard(text);
+        // Each copy spawns its own meteor with an independent lifetime; visible
+        // meteors accumulate. When every landing slot is occupied the earliest
+        // one is evicted to make room for the newcomer.
+        let visible = meteorsRef.current;
+        if (visible.length >= meteorLandingPoints.length) visible = visible.slice(1);
+        const landing = nextMeteorLanding(visible);
+        const id = ++meteorIdRef.current;
+        const entry = { id, ...landing };
+        meteorsRef.current = [...visible, entry];
+        setClipboardMeteors(meteorsRef.current);
+        const timer = window.setTimeout(() => {
+          meteorsRef.current = meteorsRef.current.filter((m) => m.id !== id);
+          setClipboardMeteors(meteorsRef.current);
+          meteorTimersRef.current.delete(timer);
         }, 7200);
+        meteorTimersRef.current.add(timer);
       } catch {
-        // Images and empty clipboards do not create a comet.
+        // Images and empty clipboards do not create a meteor.
       }
     };
     void pollClipboard();
@@ -887,7 +1072,7 @@ function App() {
         : Promise.resolve();
       void Promise.all([operation, transferAnimation])
         .then(([result]) => {
-          if (settings.autoCollapseEnabled) setAwake(false);
+          if (settings.autoCollapseEnabled) void collapseWidget();
           setDropState({
             phase: "success",
             paths: [],
@@ -939,11 +1124,102 @@ function App() {
     })();
   }, [pulse, settings.lowQuotaThreshold]);
 
+  const morphingRef = useRef(false);
+
+  // Reposition + resize the window so its CENTER stays fixed (collapsing/expanding
+  // no longer snaps the black hole to the top-left corner).
+  const applyWidgetRect = useCallback(async (target: { width: number; height: number }) => {
+    if (!isTauri) return;
+    try {
+      const appWindow = getCurrentWindow();
+      const [position, size, scale] = await Promise.all([
+        appWindow.outerPosition(),
+        appWindow.outerSize(),
+        appWindow.scaleFactor(),
+      ]);
+      const factor = scale || 1;
+      const centerX = (position.x + size.width / 2) / factor;
+      const centerY = (position.y + size.height / 2) / factor;
+      const x = Math.round(centerX - target.width / 2);
+      const y = Math.round(centerY - target.height / 2);
+      await invoke("set_widget_rect", { x, y, width: target.width, height: target.height });
+    } catch {
+      void invoke("set_widget_size", { width: target.width, height: target.height });
+    }
+  }, []);
+
+  // Black-hole swirl transition between the idle planet and the info panel.
+  // Clockwise = collapse (panel inhaled into the hole); counterclockwise = open.
+  const morphTo = useCallback(async (nextAwake: boolean, nextSettingsOpen?: boolean) => {
+    if (morphingRef.current) return; // a transition is already in progress
+    const applyState = () => {
+      if (nextSettingsOpen !== undefined) setSettingsOpen(nextSettingsOpen);
+      setAwake(nextAwake);
+    };
+    if (!isTauri) {
+      applyState();
+      return;
+    }
+    const big = nextAwake || nextSettingsOpen === true;
+    const targetSize = big ? sizeMap[settings.size] : idleSize;
+    // Swirl animation disabled: instant + centered.
+    if (!settings.swirlEnabled) {
+      await applyWidgetRect(targetSize);
+      applyState();
+      return;
+    }
+    // During an active file drop the swirl is skipped (instant + centered).
+    if (dropState.phase !== "idle") {
+      await applyWidgetRect(targetSize);
+      applyState();
+      return;
+    }
+    morphingRef.current = true;
+    const finish = () => {
+      document.documentElement.classList.remove("morph-inhale");
+      document.documentElement.classList.remove("morph-emerge");
+      morphingRef.current = false;
+    };
+    const safety = window.setTimeout(finish, 2000); // last-resort: never leave the widget stuck
+    if (nextAwake) {
+      // open: panel mounts invisibly (emerge 0%), window grows, then it swirls out counterclockwise
+      document.documentElement.classList.add("morph-emerge");
+      applyState();
+      void applyWidgetRect(targetSize);
+      window.setTimeout(() => { window.clearTimeout(safety); finish(); }, 460);
+    } else {
+      // collapse: panel inhaled clockwise (ends invisible), shrink, then swap to the idle planet
+      document.documentElement.classList.add("morph-inhale");
+      window.setTimeout(() => {
+        void applyWidgetRect(targetSize).then(() => {
+          applyState();
+          window.clearTimeout(safety);
+          finish();
+        });
+      }, 460);
+    }
+  }, [applyWidgetRect, dropState.phase, settings.size, settings.swirlEnabled]);
+
   useEffect(() => {
     if (!isTauri) return;
+    if (morphingRef.current) return; // morph controls sizing/positioning during the transition
     const target = awake || settingsOpen ? sizeMap[settings.size] : idleSize;
-    void invoke("set_widget_size", { width: target.width, height: target.height });
-  }, [awake, settings.size, settingsOpen]);
+    void applyWidgetRect(target);
+  }, [awake, settings.size, settingsOpen, applyWidgetRect]);
+
+  // While the clipboard board is open, grow the window into a popover when the
+  // active shell is too small (idle 184×164 / compact 430×72); the already-large
+  // standard/expanded shells just overlay the board without resizing. Restore the
+  // shell's natural size when the board closes.
+  useEffect(() => {
+    if (!isTauri) return;
+    if (settingsOpen) return; // sizing handled by the awake/settings effect there
+    if (morphingRef.current) return;
+    const natural = awake ? sizeMap[settings.size] : idleSize;
+    const tooSmall = natural.width < clipboardPanelSize.width || natural.height < clipboardPanelSize.height;
+    if (clipboardPanelOpen && tooSmall) void applyWidgetRect(clipboardPanelSize);
+    else if (!clipboardPanelOpen) void applyWidgetRect(natural);
+  }, [clipboardPanelOpen, awake, settings.size, settingsOpen, applyWidgetRect]);
 
   useEffect(() => {
     document.title = awake || settingsOpen ? "Codex Cosmos · 信息面板" : "Codex Cosmos · 黑洞待机";
@@ -954,7 +1230,8 @@ function App() {
     if (hoverTimer.current !== null) window.clearTimeout(hoverTimer.current);
     if (feedbackTimer.current !== null) window.clearTimeout(feedbackTimer.current);
     if (dragReleaseTimer.current !== null) window.clearTimeout(dragReleaseTimer.current);
-    if (cometTimer.current !== null) window.clearTimeout(cometTimer.current);
+    for (const timer of meteorTimersRef.current) window.clearTimeout(timer);
+    meteorTimersRef.current.clear();
     if (contextMenuTimer.current !== null) window.clearTimeout(contextMenuTimer.current);
   }, []);
 
@@ -1009,32 +1286,123 @@ function App() {
   };
 
   const toggleFocus = () => {
+    resumeAudio();
     setFocusSession((current) => {
-      if (current.remainingSeconds === 0) {
-        const remainingSeconds = current.durationMinutes * 60;
-        return { ...current, remainingSeconds, running: true, endsAt: Date.now() + remainingSeconds * 1000 };
-      }
-      if (current.running) {
-        return { ...current, running: false, endsAt: null };
-      }
-      return { ...current, running: true, endsAt: Date.now() + current.remainingSeconds * 1000 };
+      if (current.running) return { ...current, running: false, endsAt: null };
+      const remainingSeconds = current.remainingSeconds > 0 ? current.remainingSeconds : phaseSeconds(current);
+      return { ...current, remainingSeconds, running: true, endsAt: Date.now() + remainingSeconds * 1000, completedAt: null };
     });
   };
 
   const resetFocus = () => {
     setFocusSession((current) => ({
       ...current,
-      remainingSeconds: current.durationMinutes * 60,
+      remainingSeconds: phaseSeconds(current),
       running: false,
       endsAt: null,
+      completedAt: null,
     }));
   };
 
-  const replayClipboardComet = () => {
-    if (!clipboardComet) return;
-    if (isTauri) void invoke("set_clipboard_text", { text: clipboardComet.text });
-    setAwake(true);
+  const skipFocus = () => {
+    resumeAudio();
+    setFocusSession((current) => {
+      const now = Date.now();
+      const next: FocusSession = { ...current, completedAt: now };
+      if (current.phase === "focus") {
+        next.phase = "break";
+        const long = current.cycleIndex % Math.max(1, current.cyclesBeforeLongBreak) === 0;
+        const sec = (long ? current.longBreakMinutes : current.breakMinutes) * 60;
+        next.remainingSeconds = sec;
+      } else {
+        next.phase = "focus";
+        next.remainingSeconds = current.durationMinutes * 60;
+      }
+      if (current.autoChain) {
+        next.running = true;
+        next.endsAt = now + next.remainingSeconds * 1000;
+      } else {
+        next.running = false;
+        next.endsAt = null;
+      }
+      return next;
+    });
   };
+
+  const setFocusDuration = (minutes: number) => {
+    const clamped = Math.max(5, Math.min(90, Math.round(minutes)));
+    setFocusSession((current) => {
+      const next = { ...current, durationMinutes: clamped };
+      if (current.phase === "focus" && !current.running) next.remainingSeconds = clamped * 60;
+      return next;
+    });
+  };
+
+  // Local shortcuts: F = start/pause, R = reset, S = skip, C = clipboard board. Ignored while typing or settings open.
+  useEffect(() => {
+    if (!isTauri || settingsOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key === "escape") {
+        if (clipboardPanelOpen) { event.preventDefault(); setClipboardPanelOpen(false); }
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+      if (key === "f") { event.preventDefault(); toggleFocus(); }
+      else if (key === "r") { event.preventDefault(); resetFocus(); }
+      else if (key === "s") { event.preventDefault(); skipFocus(); }
+      else if (key === "c") { event.preventDefault(); setClipboardPanelOpen((open) => !open); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [settingsOpen, clipboardPanelOpen, toggleFocus, resetFocus, skipFocus]);
+
+  const reapplyClipboard = async (text: string) => {
+    if (isTauri) {
+      try { await invoke("set_clipboard_text", { text }); } catch { /* clipboard write failed */ }
+    }
+    lastClipboardRef.current = text;
+    prependClipboard(text);
+    setClipboardPanelOpen(false);
+  };
+
+  const removeClipboardEntry = (id: number) => {
+    setClipboardHistory((current) => current.filter((entry) => entry.id !== id));
+  };
+
+  // Rendered in every shell (idle / compact / standard-expanded) so pressing C overlays
+  // the clipboard board on top of whichever view is active, not just the idle black hole.
+  const renderClipboardPanel = () => clipboardPanelOpen && (
+    <div
+      className="clipboard-panel-backdrop"
+      onMouseDown={(event) => { if (event.currentTarget === event.target) setClipboardPanelOpen(false); }}
+    >
+      <section className="clipboard-panel" role="dialog" aria-label="剪贴板历史" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
+        <header className="clipboard-panel-head">
+          <span><Copy size={14} /> 剪贴板</span>
+          <button className="icon-button" onClick={() => setClipboardPanelOpen(false)} title="关闭 (C / Esc)"><X size={14} /></button>
+        </header>
+        {clipboardHistory.length === 0 ? (
+          <div className="clipboard-panel-empty">暂无记录 · 复制任意文本即可</div>
+        ) : (
+          <ul className="clipboard-list">
+            {clipboardHistory.map((entry) => (
+              <li key={entry.id} className="clipboard-item">
+                <button className="clipboard-item-main" onClick={() => void reapplyClipboard(entry.text)} title={entry.text}>
+                  <span className="clipboard-item-text">{entry.text.replace(/\s+/g, " ").slice(0, 80)}</span>
+                  <small>{formatClipboardTime(entry.copiedAt, now.getTime())}</small>
+                </button>
+                <button className="clipboard-item-delete" onClick={() => removeClipboardEntry(entry.id)} title="删除该条"><Trash2 size={12} /></button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <footer className="clipboard-panel-foot">点击条目重新写入剪贴板 · C / Esc 关闭</footer>
+      </section>
+    </div>
+  );
 
   const saveWormholeDestination = async () => {
     if (!isTauri) return;
@@ -1061,6 +1429,16 @@ function App() {
       setDropState({ phase: "error", paths: [], target: "forge", message: String(error) });
       clearFeedbackLater(3200);
     }
+  };
+
+  const pickWormholeDir = async () => {
+    const picked = await open({ directory: true });
+    if (typeof picked === "string") setWormholePathDraft(picked);
+  };
+
+  const pickForgeDir = async () => {
+    const picked = await open({ directory: true });
+    if (typeof picked === "string") setForgePathDraft(picked);
   };
 
   const parseHeaders = (text: string): UsageHeaderPair[] => text
@@ -1254,7 +1632,7 @@ function App() {
       window.clearTimeout(collapseTimer.current);
       collapseTimer.current = null;
     }
-    setAwake(true);
+    void morphTo(true);
   };
 
   const collapseWidget = () => {
@@ -1262,8 +1640,7 @@ function App() {
       window.clearTimeout(collapseTimer.current);
       collapseTimer.current = null;
     }
-    setSettingsOpen(false);
-    setAwake(false);
+    void morphTo(false, false);
   };
 
   const handlePanelDoubleClick = (event: React.MouseEvent<HTMLElement>) => {
@@ -1277,13 +1654,13 @@ function App() {
     if (!settings.autoCollapseEnabled || settingsOpen || dropState.phase !== "idle") return;
     if (collapseTimer.current !== null) return;
     collapseTimer.current = window.setTimeout(() => {
-      setAwake(false);
+      collapseWidget();
       collapseTimer.current = null;
     }, 850);
   };
 
   useEffect(() => {
-    if (!isTauri || !settings.autoCollapseEnabled) return;
+    if (!isTauri) return;
     let busy = false;
 
     const checkPointer = async () => {
@@ -1418,6 +1795,7 @@ function App() {
           if (
             cancelled
             || moving
+            || morphingRef.current
             || pointerInsideRef.current
             || manualWindowDrag.current
             || nativeFileDrag.current
@@ -1562,7 +1940,7 @@ function App() {
           weatherMode={weatherVisualMode}
           stats={ecosystemStats}
           focus={focusSession}
-          comet={clipboardComet}
+          meteors={clipboardMeteors}
           wormholeActive={dropState.target === "wormhole" && dropState.phase !== "idle"}
           wormholePhase={dropState.target === "wormhole" ? dropState.phase : "idle"}
           wormholeExit={wormholeExit}
@@ -1573,11 +1951,11 @@ function App() {
           terrainImpact={terrainImpact}
           onToggleFocus={toggleFocus}
           onResetFocus={resetFocus}
-          onCometClick={replayClipboardComet}
-          onWormholeClick={() => {
-            setAwake(true);
-            setSettingsOpen(true);
-          }}
+          onSkipFocus={skipFocus}
+          onWheelFocus={setFocusDuration}
+          onSelectFocusDuration={setFocusDuration}
+          onMeteorClick={() => setClipboardPanelOpen(true)}
+          onWormholeClick={() => { void morphTo(true, true); }}
         />
         <BlackHoleCore
           phase={dropState.phase}
@@ -1586,7 +1964,7 @@ function App() {
           onMouseDown={beginWindowDrag}
           onWake={() => {
             if (awake) {
-              setAwake(false);
+              void collapseWidget();
             } else {
               wakeWidget();
             }
@@ -1597,6 +1975,7 @@ function App() {
           recycledCount={ecosystemStats.totalRecycled}
           {...terrainProps}
         />
+        {renderClipboardPanel()}
       </main>
     );
   }
@@ -1640,6 +2019,7 @@ function App() {
           </div>
           <button className="icon-button compact-expand" onClick={() => updateSize("standard")} title="展开"><Maximize2 size={15} /></button>
         </div>
+        {renderClipboardPanel()}
       </main>
     );
   }
@@ -1884,8 +2264,10 @@ function App() {
                 {locationResults.length > 0 && <div className="location-results">{locationResults.map((result) => <button key={`${result.latitude}-${result.longitude}`} onClick={() => chooseLocation(result)}><MapPin size={13}/><span>{result.name}<small>{[result.admin1, result.country].filter(Boolean).join(" · ")}</small></span><ChevronDown size={12}/></button>)}</div>}
               </div>
               <div className="setting-row"><div><strong>始终置顶</strong><span>让组件保持在其他窗口上方</span></div><button className={`toggle ${settings.topmost ? "on" : ""}`} onClick={toggleTopmost}><i /></button></div>
+              <div className="setting-row"><div><strong>截图隐身</strong><span>窗口排除出截图与录屏；关闭后可被截到，但黑洞透镜会显示自身界面</span></div><button className={`toggle ${settings.excludeFromCapture ? "on" : ""}`} onClick={() => saveSettings({ ...settings, excludeFromCapture: !settings.excludeFromCapture })}><i /></button></div>
               <div className="setting-row"><div><strong>开机启动</strong><span>登录系统后自动运行</span></div><button className={`toggle ${settings.autostart ? "on" : ""}`} onClick={toggleAutostart}><i /></button></div>
               <div className="setting-row"><div><strong>自动回收</strong><span>关闭后标签以面板形式常驻，双击仍可手动收回</span></div><button className={`toggle ${settings.autoCollapseEnabled ? "on" : ""}`} onClick={toggleAutoCollapse}><i /></button></div>
+              <div className="setting-row"><div><strong>收放漩涡</strong><span>面板展开/收回时的黑洞旋涡动画，关闭则瞬时切换</span></div><button className={`toggle ${settings.swirlEnabled ? "on" : ""}`} onClick={() => saveSettings({ ...settings, swirlEnabled: !settings.swirlEnabled })}><i /></button></div>
               <div className="setting-row"><div><strong>天气模块</strong><span>关闭后不访问天气服务</span></div><button className={`toggle ${settings.weatherEnabled ? "on" : ""}`} onClick={() => saveSettings({ ...settings, weatherEnabled: !settings.weatherEnabled })}><i /></button></div>
               <div className="setting-group">
                 <label>天气视觉联动 <b>{settings.weatherVisualMode === "off" ? "关闭" : settings.weatherVisualMode === "subtle" ? "轻柔" : "沉浸"}</b></label>
@@ -1907,16 +2289,36 @@ function App() {
               </div>
               <div className="setting-group">
                 <label>虫洞目标 <b>{ecosystemStats.totalWormholeMoves} 次穿越</b></label>
-                <div className="search-box wormhole-path"><FolderInput size={14} /><input value={wormholePathDraft} onChange={(event) => setWormholePathDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void saveWormholeDestination(); }} placeholder="绝对目录路径" /><button onClick={saveWormholeDestination}>保存</button></div>
+                <div className="search-box wormhole-path"><FolderInput size={14} /><input value={wormholePathDraft} onChange={(event) => setWormholePathDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void saveWormholeDestination(); }} placeholder="绝对目录路径" /><button onClick={() => void pickWormholeDir()}>浏览</button><button onClick={saveWormholeDestination}>保存</button></div>
               </div>
               <div className="setting-group">
                 <label>星炉目标 <b>{ecosystemStats.totalForged} 次处理</b></label>
-                <div className="search-box wormhole-path"><FolderInput size={14} /><input value={forgePathDraft} onChange={(event) => setForgePathDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void saveForgeDestination(); }} placeholder="ZIP 输出绝对目录" /><button onClick={saveForgeDestination}>保存</button></div>
+                <div className="search-box wormhole-path"><FolderInput size={14} /><input value={forgePathDraft} onChange={(event) => setForgePathDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void saveForgeDestination(); }} placeholder="ZIP 输出绝对目录" /><button onClick={() => void pickForgeDir()}>浏览</button><button onClick={saveForgeDestination}>保存</button></div>
                 <small className="setting-hint">投入 ZIP 会安全解压；投入其他文件或文件夹会生成 ZIP。原文件始终保留。</small>
               </div>
-              <div className="setting-group">
-                <label>专注月球 <b>{focusSession.durationMinutes} 分钟</b></label>
-                <div className="segmented">{[25, 45, 60].map((minutes) => <button key={minutes} className={focusSession.durationMinutes === minutes ? "active" : ""} onClick={() => setFocusSession({ durationMinutes: minutes, remainingSeconds: minutes * 60, running: false, endsAt: null })}>{minutes}m</button>)}</div>
+              <RelayPanel />
+              <div className="setting-group focus-settings">
+                <label>专注月球</label>
+                <div className="focus-line"><span>专注时长</span><div className="segmented">{[25, 45, 60].map((minutes) => <button key={minutes} className={focusSession.durationMinutes === minutes ? "active" : ""} onClick={() => setFocusDuration(minutes)}>{minutes}m</button>)}</div></div>
+                <div className="focus-line"><span>短休息</span><div className="segmented">{[5, 10, 15].map((minutes) => <button key={minutes} className={focusSession.breakMinutes === minutes ? "active" : ""} onClick={() => setFocusSession((current) => ({ ...current, breakMinutes: minutes }))}>{minutes}m</button>)}</div></div>
+                <div className="focus-line"><span>长休息</span><div className="segmented">{[15, 20, 30].map((minutes) => <button key={minutes} className={focusSession.longBreakMinutes === minutes ? "active" : ""} onClick={() => setFocusSession((current) => ({ ...current, longBreakMinutes: minutes }))}>{minutes}m</button>)}</div></div>
+                <div className="focus-line"><span>长休息周期</span><div className="segmented">{[3, 4, 6].map((cycles) => <button key={cycles} className={focusSession.cyclesBeforeLongBreak === cycles ? "active" : ""} onClick={() => setFocusSession((current) => ({ ...current, cyclesBeforeLongBreak: cycles }))}>{cycles} 轮</button>)}</div></div>
+                <div className="setting-row"><div><strong>自动衔接</strong><span>专注结束自动进入休息，休息结束自动开始下一轮</span></div><button className={`toggle ${focusSession.autoChain ? "on" : ""}`} onClick={() => setFocusSession((current) => ({ ...current, autoChain: !current.autoChain }))}><i /></button></div>
+                <div className="focus-stats">
+                  <div><b>{Math.round(focusSession.todayFocusSeconds / 60)}</b><span>今日分钟</span></div>
+                  <div><b>{(focusSession.totalFocusSeconds / 3600).toFixed(1)}</b><span>累计小时</span></div>
+                  <div><b>{focusSession.completedCount}</b><span>完成次数</span></div>
+                </div>
+                {focusSession.history.length > 0 && (
+                  <div className="focus-history">
+                    {focusSession.history.slice(0, 8).map((entry, index) => (
+                      <div key={`${entry.at}-${index}`} className="focus-history-row">
+                        <span>{entry.phase === "focus" ? "专注" : "休息"} · {entry.minutes}m</span>
+                        <small>{new Date(entry.at).toLocaleString()}</small>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
               <div className="setting-group">
                 <label>低额度提醒阈值 <b>{settings.lowQuotaThreshold}%</b></label>
@@ -1971,11 +2373,12 @@ function App() {
               </div>
               <div className="privacy-note"><LocateFixed size={15}/><p><strong>隐私优先</strong><span>Codex 额度只读取本机事件；天气仅发送你选择的城市坐标，不读取账号令牌。</span></p></div>
               {capabilities && <div className="capability-card liquid-glass-tag"><strong>{capabilities.desktopCapture ? "实时桌面透镜" : "安全降级模式"}</strong><span>{capabilities.platform} · {capabilities.session}{capabilities.fallbackReason ? ` · ${capabilities.fallbackReason}` : " · 当前显示器独立采样"}</span></div>}
-              <div className="settings-version">CODEX COSMOS 1.1.0 · RUGGED DESKTOP</div>
+              <div className="settings-version">CODEX COSMOS 1.1.1 · RUGGED DESKTOP</div>
             </aside>
           </div>
         )}
       </section>
+      {renderClipboardPanel()}
     </main>
   );
 }
