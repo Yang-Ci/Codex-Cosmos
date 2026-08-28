@@ -1,6 +1,7 @@
 export type WidgetSize = "compact" | "standard" | "expanded";
 export type DropPhase = "idle" | "ready" | "processing" | "success" | "error" | "restoring";
 export type WeatherVisualMode = "off" | "subtle" | "immersive";
+export type SurfaceStyle = "liquid-glass" | "solid-card";
 export type TerrainMode = "none" | "gravity" | "crater" | "liquid" | "snow" | "dunes" | "dust";
 export type EffectQuality = "eco" | "balanced" | "cinematic";
 
@@ -155,6 +156,7 @@ export interface Settings {
   quoteCategory: "mixed" | "tech" | "philosophy";
   weatherEnabled: boolean;
   weatherVisualMode: WeatherVisualMode;
+  surfaceStyle: SurfaceStyle;
   autoCollapseEnabled: boolean;
   swirlEnabled: boolean;
   idleDriftEnabled: boolean;

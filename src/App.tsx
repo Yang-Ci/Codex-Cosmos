@@ -83,6 +83,7 @@ import type {
   RecycleBatch,
   RecycleResult,
   Settings,
+  SurfaceStyle,
   TerrainMode,
   UsageHeaderPair,
   UsageProviderConfig,
@@ -176,6 +177,7 @@ const defaultSettings: Settings = {
   quoteCategory: "mixed",
   weatherEnabled: true,
   weatherVisualMode: "immersive",
+  surfaceStyle: "liquid-glass",
   autoCollapseEnabled: true,
   swirlEnabled: true,
   idleDriftEnabled: true,
@@ -1932,7 +1934,7 @@ function App() {
   if (!awake && isTauri) {
     return (
       <main
-        className="app black-hole-shell"
+        className={`app black-hole-shell surface-${settings.surfaceStyle}`}
         onPointerDown={recordTerrainImpact}
       >
         <DesktopEcosystem
@@ -1982,7 +1984,7 @@ function App() {
 
   if (settings.size === "compact") {
     return (
-      <main className="app compact-shell" data-theme={weather?.isDay === false ? "night" : "day"}>
+      <main className={`app compact-shell surface-${settings.surfaceStyle}`} data-theme={weather?.isDay === false ? "night" : "day"}>
         {dropState.phase !== "idle" && (
           <div className={`drop-overlay compact-drop-overlay drop-overlay-${dropState.phase}`}>
             {dropState.phase === "ready" && <DropTargetGuide target={dropState.target} />}
@@ -2025,7 +2027,7 @@ function App() {
   }
 
   return (
-    <main className={`app ${settings.size}`} data-theme={weather?.isDay === false ? "night" : "day"}>
+    <main className={`app ${settings.size} surface-${settings.surfaceStyle}`} data-theme={weather?.isDay === false ? "night" : "day"}>
       {dropState.phase !== "idle" && (
         <div className={`drop-overlay drop-overlay-${dropState.phase}`}>
           {dropState.phase === "ready" && <DropTargetGuide target={dropState.target} />}
@@ -2272,6 +2274,11 @@ function App() {
               <div className="setting-group">
                 <label>天气视觉联动 <b>{settings.weatherVisualMode === "off" ? "关闭" : settings.weatherVisualMode === "subtle" ? "轻柔" : "沉浸"}</b></label>
                 <div className="segmented">{(["off", "subtle", "immersive"] as WeatherVisualMode[]).map((mode) => <button key={mode} className={settings.weatherVisualMode === mode ? "active" : ""} onClick={() => saveSettings({ ...settings, weatherVisualMode: mode })}>{mode === "off" ? "关闭" : mode === "subtle" ? "轻柔" : "沉浸"}</button>)}</div>
+              </div>
+              <div className="setting-group surface-style-setting">
+                <label>界面材质 <b>{settings.surfaceStyle === "liquid-glass" ? "液态玻璃" : "实体卡片"}</b></label>
+                <div className="segmented surface-style-options">{(["liquid-glass", "solid-card"] as SurfaceStyle[]).map((style) => <button key={style} className={settings.surfaceStyle === style ? "active" : ""} onClick={() => saveSettings({ ...settings, surfaceStyle: style })}>{style === "liquid-glass" ? "液态玻璃" : "实体卡片"}</button>)}</div>
+                <small className="setting-hint">液态玻璃使用背景模糊、高光折射与半透明层次；实体卡片强调稳定对比度。</small>
               </div>
               <div className="setting-row"><div><strong>边缘巡游</strong><span>待机时沿屏幕边缘缓慢移动</span></div><button className={`toggle ${settings.idleDriftEnabled ? "on" : ""}`} onClick={() => saveSettings({ ...settings, idleDriftEnabled: !settings.idleDriftEnabled })}><i /></button></div>
               <div className="setting-group">

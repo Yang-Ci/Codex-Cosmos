@@ -285,7 +285,7 @@ export function RelayPanel() {
     draftAlias !== config.alias || draftDestination !== config.destination;
 
   return (
-    <div style={panelStyle}>
+    <div className="relay-panel" style={panelStyle}>
       <div style={rowStyle}>
         <div style={titleStyle}>
           <RadioTower size={14} />
