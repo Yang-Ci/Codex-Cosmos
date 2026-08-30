@@ -710,6 +710,7 @@ html.morph-emerge .app:not(.black-hole-shell) {
 }
 
 .app.expanded .widget { overflow-y: scroll; }
+.app.settings-open .widget { overflow-y: hidden; }
 
 .app.standard .widget::-webkit-scrollbar,
 .app.expanded .widget::-webkit-scrollbar { width: 7px; }
@@ -1053,7 +1054,7 @@ footer > span { display: flex; align-items: center; gap: 6px; }
 
 /* Settings */
 .settings-backdrop { position: fixed; z-index: 10; inset: 0; display: flex; justify-content: flex-end; background: rgba(2,6,7,.67); backdrop-filter: blur(5px); }
-.settings-panel { width: min(336px, 88%); height: 100%; overflow-y: auto; padding: 21px 19px; border-left: 1px solid rgba(255,255,255,.09); background: linear-gradient(155deg, #151e1d, #0b1112); box-shadow: -18px 0 50px rgba(0,0,0,.35); animation: slide-in .22s ease both; }
+.settings-panel { width: min(336px, 88%); height: 100%; overflow-y: auto; overscroll-behavior: contain; padding: 21px 19px; border-left: 1px solid rgba(255,255,255,.09); background: linear-gradient(155deg, #151e1d, #0b1112); box-shadow: -18px 0 50px rgba(0,0,0,.35); animation: slide-in .22s ease both; }
 @keyframes slide-in { from { transform: translateX(18px); opacity: 0; } }
 .settings-title { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 19px; }
 .settings-title div { display: flex; flex-direction: column; }

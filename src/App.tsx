@@ -67,6 +67,7 @@ import { DesktopEcosystem } from "./DesktopEcosystem";
 import { RelayPanel } from "./RelayPanel";
 import { RelayIncomingPrompt, useRelayIncomingRequests } from "./RelayIncomingPrompt";
 import { RelaySendStatus, useRelaySendStatus } from "./RelaySendStatus";
+import appPackage from "../package.json";
 import type {
   BalanceDetailsSnapshot,
   BalancePreset,
@@ -2061,7 +2062,7 @@ function App() {
   }
 
   return (
-    <main className={`app ${settings.size} surface-${settings.surfaceStyle}`} data-theme={weather?.isDay === false ? "night" : "day"}>
+    <main className={`app ${settings.size}${settingsOpen ? " settings-open" : ""} surface-${settings.surfaceStyle}`} data-theme={weather?.isDay === false ? "night" : "day"}>
       <RelaySendStatus {...relaySend} />
       <RelayIncomingPrompt {...relayIncoming} />
       {dropState.phase !== "idle" && (
@@ -2442,7 +2443,7 @@ function App() {
               </div>
               <div className="privacy-note"><LocateFixed size={15}/><p><strong>隐私优先</strong><span>Codex 额度只读取本机事件；天气仅发送你选择的城市坐标，不读取账号令牌。</span></p></div>
               {capabilities && <div className="capability-card liquid-glass-tag"><strong>{capabilities.desktopCapture ? "实时桌面透镜" : "安全降级模式"}</strong><span>{capabilities.platform} · {capabilities.session}{capabilities.fallbackReason ? ` · ${capabilities.fallbackReason}` : " · 当前显示器独立采样"}</span></div>}
-              <div className="settings-version">CODEX COSMOS 1.1.1 · RUGGED DESKTOP</div>
+              <div className="settings-version">CODEX COSMOS {appPackage.version} · RUGGED DESKTOP</div>
             </aside>
           </div>
         )}
