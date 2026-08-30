@@ -190,7 +190,10 @@ pub fn run() {
             relay::relay_devices,
             relay::relay_stats,
             relay::relay_recent,
-            relay::clear_relay_recent
+            relay::clear_relay_recent,
+            relay::respond_relay_request,
+            relay::start_relay_send,
+            relay::cancel_relay_send
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Cosmos");

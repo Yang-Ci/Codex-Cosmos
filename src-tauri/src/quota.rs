@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     cmp::Reverse,
+    collections::BTreeMap,
     env,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
@@ -83,7 +84,8 @@ struct CandidateEvent {
 }
 
 pub fn collect_pulse_data(app: &tauri::AppHandle) -> Result<PulseData, String> {
-    let latest = find_latest_quota()?;
+    let events = find_quota_events()?;
+    let latest = events.last().map(|event| event.snapshot.clone());
     let history_path = app
         .path()
         .app_data_dir()
@@ -91,17 +93,32 @@ pub fn collect_pulse_data(app: &tauri::AppHandle) -> Result<PulseData, String> {
         .join("quota-history.json");
 
     let mut history = read_history(&history_path);
-    if let Some(event) = latest.as_ref() {
-        record_sample(&mut history, event);
-        write_history(&history_path, &history)?;
+    if !events.is_empty() {
+        merge_samples(&mut history, &events);
     }
 
     let cutoff = Utc::now().timestamp() - HISTORY_DAYS * 86_400;
     history.retain(|point| point.sampled_at >= cutoff);
-    let estimate = estimate_monthly_usage(&history);
+    if !events.is_empty() {
+        write_history(&history_path, &history)?;
+    }
+    let estimate_window = latest.as_ref().map(|snapshot| {
+        snapshot
+            .secondary
+            .as_ref()
+            .filter(|secondary| secondary.window_minutes > snapshot.primary.window_minutes)
+            .map(|secondary| secondary.window_minutes)
+            .unwrap_or(snapshot.primary.window_minutes)
+    });
+    let estimate_history: Vec<_> = history
+        .iter()
+        .filter(|point| estimate_window.map_or(true, |window| point.window_minutes == window))
+        .cloned()
+        .collect();
+    let estimate = estimate_monthly_usage(&estimate_history);
 
     Ok(PulseData {
-        quota: latest.map(|event| event.snapshot),
+        quota: latest,
         history,
         monthly_estimate: estimate,
         error: None,
@@ -119,7 +136,7 @@ fn codex_home() -> Result<PathBuf, String> {
         .ok_or_else(|| "无法找到用户主目录".to_string())
 }
 
-fn find_latest_quota() -> Result<Option<CandidateEvent>, String> {
+fn find_quota_events() -> Result<Vec<CandidateEvent>, String> {
     let root = codex_home()?;
     let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
 
@@ -127,7 +144,11 @@ fn find_latest_quota() -> Result<Option<CandidateEvent>, String> {
         if !folder.exists() {
             continue;
         }
-        for entry in WalkDir::new(folder).follow_links(false).into_iter().filter_map(Result::ok) {
+        for entry in WalkDir::new(folder)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
             if !entry.file_type().is_file()
                 || entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl")
             {
@@ -145,23 +166,19 @@ fn find_latest_quota() -> Result<Option<CandidateEvent>, String> {
     candidates.sort_by_key(|(modified, _)| Reverse(*modified));
     candidates.truncate(MAX_SESSION_FILES);
 
-    let mut latest: Option<CandidateEvent> = None;
+    let mut events = Vec::new();
     for (_, path) in candidates {
         for line in read_tail_lines(&path)? {
             let Some(event) = parse_quota_event(&line) else {
                 continue;
             };
-            if latest
-                .as_ref()
-                .map(|current| event.sampled_at > current.sampled_at)
-                .unwrap_or(true)
-            {
-                latest = Some(event);
-            }
+            events.push(event);
         }
     }
 
-    Ok(latest)
+    events.sort_by_key(|event| event.sampled_at);
+    events.dedup_by_key(|event| event.sampled_at);
+    Ok(events)
 }
 
 fn read_tail_lines(path: &Path) -> Result<Vec<String>, String> {
@@ -208,10 +225,7 @@ fn parse_quota_event(line: &str) -> Option<CandidateEvent> {
             balance: value_as_string(credits.get("balance")),
         })
     });
-    let stale = Utc::now()
-        .signed_duration_since(sampled_at)
-        .num_hours()
-        >= 6;
+    let stale = Utc::now().signed_duration_since(sampled_at).num_hours() >= 6;
 
     Some(CandidateEvent {
         sampled_at,
@@ -266,31 +280,69 @@ fn write_history(path: &Path, history: &[QuotaHistoryPoint]) -> Result<(), Strin
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("创建历史目录失败: {error}"))?;
     }
-    let content = serde_json::to_string(history).map_err(|error| format!("序列化历史失败: {error}"))?;
+    let content =
+        serde_json::to_string(history).map_err(|error| format!("序列化历史失败: {error}"))?;
     fs::write(path, content).map_err(|error| format!("保存额度历史失败: {error}"))
 }
 
-fn record_sample(history: &mut Vec<QuotaHistoryPoint>, event: &CandidateEvent) {
-    let point = QuotaHistoryPoint {
-        sampled_at: event.sampled_at.timestamp(),
-        used_percent: event.snapshot.primary.used_percent,
-        window_minutes: event.snapshot.primary.window_minutes,
-        resets_at: event.snapshot.primary.resets_at,
-    };
+fn history_point(sampled_at: i64, window: &RateWindow) -> QuotaHistoryPoint {
+    QuotaHistoryPoint {
+        sampled_at,
+        used_percent: window.used_percent,
+        window_minutes: window.window_minutes,
+        resets_at: window.resets_at,
+    }
+}
 
-    let should_append = history.last().map_or(true, |previous| {
+fn history_points(event: &CandidateEvent) -> Vec<QuotaHistoryPoint> {
+    let sampled_at = event.sampled_at.timestamp();
+    let mut points = vec![history_point(sampled_at, &event.snapshot.primary)];
+    if let Some(secondary) = event.snapshot.secondary.as_ref() {
+        if secondary.window_minutes != event.snapshot.primary.window_minutes {
+            points.push(history_point(sampled_at, secondary));
+        }
+    }
+    points
+}
+
+fn should_append_sample(previous: Option<&QuotaHistoryPoint>, point: &QuotaHistoryPoint) -> bool {
+    previous.map_or(true, |previous| {
         point.sampled_at - previous.sampled_at >= 15 * 60
             || (point.used_percent - previous.used_percent).abs() >= 0.1
-            || !same_quota_cycle(previous, &point)
-    });
-    if should_append {
-        history.push(point);
+            || !same_quota_cycle(previous, point)
+    })
+}
+
+fn merge_samples(history: &mut Vec<QuotaHistoryPoint>, events: &[CandidateEvent]) {
+    let mut points_by_window_and_time = BTreeMap::new();
+    for point in history.drain(..) {
+        points_by_window_and_time.insert((point.window_minutes, point.sampled_at), point);
     }
-    history.sort_by_key(|point| point.sampled_at);
-    history.dedup_by_key(|point| point.sampled_at);
-    if history.len() > 2_000 {
-        history.drain(0..history.len() - 2_000);
+    for event in events {
+        for point in history_points(event) {
+            // Fresh session data takes precedence over a stored sample for the same window and time.
+            points_by_window_and_time.insert((point.window_minutes, point.sampled_at), point);
+        }
     }
+
+    let mut compacted: Vec<QuotaHistoryPoint> = Vec::new();
+    let mut previous_by_window = BTreeMap::new();
+    for point in points_by_window_and_time.into_values() {
+        if should_append_sample(previous_by_window.get(&point.window_minutes), &point) {
+            previous_by_window.insert(point.window_minutes, point.clone());
+            compacted.push(point);
+        }
+    }
+    compacted.sort_by_key(|point| (point.sampled_at, point.window_minutes));
+    if compacted.len() > 2_000 {
+        compacted.drain(0..compacted.len() - 2_000);
+    }
+    *history = compacted;
+}
+
+#[cfg(test)]
+fn record_sample(history: &mut Vec<QuotaHistoryPoint>, event: &CandidateEvent) {
+    merge_samples(history, std::slice::from_ref(event));
 }
 
 fn same_quota_cycle(left: &QuotaHistoryPoint, right: &QuotaHistoryPoint) -> bool {
@@ -327,7 +379,8 @@ fn estimate_monthly_usage(history: &[QuotaHistoryPoint]) -> MonthlyEstimate {
         }
     }
 
-    let observed_days = ((history.last().unwrap().sampled_at - history.first().unwrap().sampled_at) as f64
+    let observed_days = ((history.last().unwrap().sampled_at - history.first().unwrap().sampled_at)
+        as f64
         / 86_400.0)
         .max(1.0);
     let estimate = (consumption / observed_days * 30.0).clamp(0.0, 999.0);
@@ -361,11 +414,113 @@ mod tests {
     }
 
     #[test]
+    fn parses_five_hour_and_weekly_windows() {
+        let line = r#"{"timestamp":"2026-08-28T03:43:26.893Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":98.0,"window_minutes":300,"resets_at":1787898519},"secondary":{"used_percent":15.0,"window_minutes":10080,"resets_at":1788485319},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"plan_type":"plus"}}}"#;
+        let event = parse_quota_event(line).expect("quota event should parse");
+        let weekly = event
+            .snapshot
+            .secondary
+            .as_ref()
+            .expect("weekly window should exist");
+        assert_eq!(event.snapshot.primary.window_minutes, 300);
+        assert_eq!(event.snapshot.primary.remaining_percent, 2.0);
+        assert_eq!(weekly.window_minutes, 10_080);
+        assert_eq!(weekly.remaining_percent, 85.0);
+    }
+
+    #[test]
+    fn history_tracks_both_official_windows_when_available() {
+        let event = CandidateEvent {
+            sampled_at: DateTime::parse_from_rfc3339("2026-08-28T03:43:26.893Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            snapshot: QuotaSnapshot {
+                found: true,
+                sampled_at: "2026-08-28T03:43:26.893Z".to_string(),
+                plan_type: "plus".to_string(),
+                limit_id: "codex".to_string(),
+                primary: RateWindow {
+                    used_percent: 98.0,
+                    remaining_percent: 2.0,
+                    window_minutes: 300,
+                    resets_at: 1_787_898_519,
+                },
+                secondary: Some(RateWindow {
+                    used_percent: 15.0,
+                    remaining_percent: 85.0,
+                    window_minutes: 10_080,
+                    resets_at: 1_788_485_319,
+                }),
+                credits: None,
+                source: "local-session".to_string(),
+                stale: false,
+            },
+        };
+        let mut history = Vec::new();
+        record_sample(&mut history, &event);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].window_minutes, 300);
+        assert_eq!(history[0].used_percent, 98.0);
+        assert_eq!(history[1].window_minutes, 10_080);
+        assert_eq!(history[1].used_percent, 15.0);
+    }
+
+    #[test]
+    fn session_backfill_keeps_separate_five_hour_and_weekly_series() {
+        let first = parse_quota_event(r#"{"timestamp":"2026-08-28T03:43:26.893Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":98.0,"window_minutes":300,"resets_at":1787898519},"secondary":{"used_percent":15.0,"window_minutes":10080,"resets_at":1788485319}}}}"#).unwrap();
+        let second = parse_quota_event(r#"{"timestamp":"2026-08-28T04:03:26.893Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":2.0,"window_minutes":300,"resets_at":1787902119},"secondary":{"used_percent":16.0,"window_minutes":10080,"resets_at":1788485319}}}}"#).unwrap();
+        let mut history = vec![
+            QuotaHistoryPoint {
+                sampled_at: first.sampled_at.timestamp(),
+                used_percent: 98.0,
+                window_minutes: 300,
+                resets_at: 1_787_898_519,
+            },
+            QuotaHistoryPoint {
+                sampled_at: first.sampled_at.timestamp() + 60,
+                used_percent: 99.0,
+                window_minutes: 300,
+                resets_at: 1_787_898_519,
+            },
+        ];
+
+        merge_samples(&mut history, &[first, second]);
+
+        let five_hour: Vec<_> = history
+            .iter()
+            .filter(|point| point.window_minutes == 300)
+            .collect();
+        let weekly: Vec<_> = history
+            .iter()
+            .filter(|point| point.window_minutes == 10_080)
+            .collect();
+        assert_eq!(five_hour.len(), 3);
+        assert_eq!(weekly.len(), 2);
+        assert_eq!(weekly[0].used_percent, 15.0);
+        assert_eq!(weekly[1].used_percent, 16.0);
+    }
+
+    #[test]
     fn estimates_consumption_across_reset() {
         let history = vec![
-            QuotaHistoryPoint { sampled_at: 1_000_000, used_percent: 60.0, window_minutes: 10080, resets_at: 2_000_000 },
-            QuotaHistoryPoint { sampled_at: 1_086_400, used_percent: 80.0, window_minutes: 10080, resets_at: 2_000_000 },
-            QuotaHistoryPoint { sampled_at: 1_172_800, used_percent: 10.0, window_minutes: 10080, resets_at: 3_000_000 },
+            QuotaHistoryPoint {
+                sampled_at: 1_000_000,
+                used_percent: 60.0,
+                window_minutes: 10080,
+                resets_at: 2_000_000,
+            },
+            QuotaHistoryPoint {
+                sampled_at: 1_086_400,
+                used_percent: 80.0,
+                window_minutes: 10080,
+                resets_at: 2_000_000,
+            },
+            QuotaHistoryPoint {
+                sampled_at: 1_172_800,
+                used_percent: 10.0,
+                window_minutes: 10080,
+                resets_at: 3_000_000,
+            },
         ];
         let estimate = estimate_monthly_usage(&history);
         assert_eq!(estimate.samples, 3);
@@ -374,8 +529,18 @@ mod tests {
 
     #[test]
     fn treats_reset_time_jitter_as_the_same_cycle() {
-        let left = QuotaHistoryPoint { sampled_at: 1_000_000, used_percent: 47.0, window_minutes: 10080, resets_at: 2_000_000 };
-        let right = QuotaHistoryPoint { sampled_at: 1_000_060, used_percent: 47.0, window_minutes: 10080, resets_at: 2_000_119 };
+        let left = QuotaHistoryPoint {
+            sampled_at: 1_000_000,
+            used_percent: 47.0,
+            window_minutes: 10080,
+            resets_at: 2_000_000,
+        };
+        let right = QuotaHistoryPoint {
+            sampled_at: 1_000_060,
+            used_percent: 47.0,
+            window_minutes: 10080,
+            resets_at: 2_000_119,
+        };
         assert!(same_quota_cycle(&left, &right));
     }
 
@@ -383,10 +548,30 @@ mod tests {
     fn monthly_estimate_ignores_same_cycle_regressions_and_rebounds() {
         let day = 86_400;
         let history = vec![
-            QuotaHistoryPoint { sampled_at: 1_000_000, used_percent: 40.0, window_minutes: 10080, resets_at: 2_000_000 },
-            QuotaHistoryPoint { sampled_at: 1_000_000 + day, used_percent: 47.0, window_minutes: 10080, resets_at: 2_000_060 },
-            QuotaHistoryPoint { sampled_at: 1_000_000 + day * 2, used_percent: 39.0, window_minutes: 10080, resets_at: 1_999_940 },
-            QuotaHistoryPoint { sampled_at: 1_000_000 + day * 3, used_percent: 49.0, window_minutes: 10080, resets_at: 2_000_030 },
+            QuotaHistoryPoint {
+                sampled_at: 1_000_000,
+                used_percent: 40.0,
+                window_minutes: 10080,
+                resets_at: 2_000_000,
+            },
+            QuotaHistoryPoint {
+                sampled_at: 1_000_000 + day,
+                used_percent: 47.0,
+                window_minutes: 10080,
+                resets_at: 2_000_060,
+            },
+            QuotaHistoryPoint {
+                sampled_at: 1_000_000 + day * 2,
+                used_percent: 39.0,
+                window_minutes: 10080,
+                resets_at: 1_999_940,
+            },
+            QuotaHistoryPoint {
+                sampled_at: 1_000_000 + day * 3,
+                used_percent: 49.0,
+                window_minutes: 10080,
+                resets_at: 2_000_030,
+            },
         ];
         let estimate = estimate_monthly_usage(&history);
         assert!((estimate.used_percent - 90.0).abs() < f64::EPSILON);

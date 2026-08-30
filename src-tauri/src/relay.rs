@@ -2,7 +2,7 @@
 //!
 //! 协议严格对齐 LocalSend v2.2（来自 localsend 源码 `packages/core`）：
 //! - 多播组 `224.0.0.167`（DEFAULT_MULTICAST_GROUP），端口 `53317`。
-//! - 发现是 **announce-only**：设备发 UDP 多播 announce，收到他人 announce 后
+//! - 发现是 **announce-only**：设备发 UDP 多播及子网定向广播 announce，收到他人 announce 后
 //!   通过 **HTTP `POST /api/localsend/v2/register`** 单播回复自己信息。
 //! - 每个网络接口绑一个 socket（`SO_REUSEADDR` + `IP_MULTICAST_IF` +
 //!   loopback on + ttl 1），多播 loopback 开启以便同机实例互见。
@@ -11,7 +11,7 @@
 
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -24,17 +24,33 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashMap,
     fs,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    io::{self, Read},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     io::AsyncWriteExt,
     net::UdpSocket,
+    sync::oneshot,
 };
 use uuid::Uuid;
+
+use rustls::{
+    client::{
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        WebPkiServerVerifier,
+    },
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore,
+    SignatureScheme,
+};
+use sha2::{Digest, Sha256};
 
 /// LocalSend v2.2 默认多播组。位于 224.0.0.0/24，因部分 Android 只能收该范围多播。
 const DEFAULT_PORT: u16 = 53317;
@@ -49,6 +65,11 @@ const RECENT_LIMIT: usize = 50;
 const PROGRESS_EMIT_BYTES: u64 = 512 * 1024;
 const RECEIVE_BUFFER_SIZE: usize = 65536;
 const REGISTER_TIMEOUT_SECS: u64 = 5;
+const APPROVAL_TIMEOUT_SECS: u64 = 60;
+const SEND_CONNECT_TIMEOUT_SECS: u64 = 10;
+const SEND_REQUEST_TIMEOUT_SECS: u64 = 120;
+const RELAY_KEYRING_SERVICE: &str = "codex-cosmos";
+const RELAY_KEYRING_USER: &str = "relay-tls-identity-v1";
 
 /// 设备信息。用于多播 announce、register 请求体、prepare-upload 的 info 字段。
 #[derive(Clone, Serialize, Deserialize)]
@@ -139,7 +160,82 @@ struct UploadSession {
 
 struct DeviceRecord {
     info: DeviceInfo,
+    ip: IpAddr,
     last_seen: Instant,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayDevice {
+    #[serde(flatten)]
+    info: DeviceInfo,
+    ip: String,
+}
+
+struct PendingApproval {
+    response: oneshot::Sender<bool>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IncomingFile {
+    file_name: String,
+    size: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IncomingRequest {
+    request_id: String,
+    sender: String,
+    files: Vec<IncomingFile>,
+    total_bytes: u64,
+    expires_in_seconds: u64,
+}
+
+#[derive(Clone)]
+struct RelayIdentity {
+    certificate_pem: String,
+    private_key_pem: String,
+    fingerprint: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredRelayIdentity {
+    certificate_pem: String,
+    private_key_pem: String,
+}
+
+#[derive(Clone)]
+struct OutgoingFile {
+    id: String,
+    path: PathBuf,
+    file_name: String,
+    size: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutgoingFileMeta {
+    id: String,
+    file_name: String,
+    size: u64,
+    file_type: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutgoingPrepareRequest {
+    info: DeviceInfo,
+    files: HashMap<String, OutgoingFileMeta>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OutgoingPrepareResponse {
+    session_id: String,
+    files: HashMap<String, String>,
 }
 
 /// 星际通讯站持久化配置。fingerprint 为设备唯一指纹，首次生成后存盘。
@@ -169,7 +265,7 @@ fn default_alias() -> String {
 }
 
 fn default_auto_accept() -> bool {
-    true
+    false
 }
 
 fn default_destination_string() -> String {
@@ -187,7 +283,7 @@ impl Default for RelayConfig {
             port: DEFAULT_PORT,
             alias: default_alias(),
             destination: default_destination_string(),
-            auto_accept: true,
+            auto_accept: false,
             fingerprint: String::new(),
         }
     }
@@ -218,6 +314,9 @@ struct RelayInner {
     devices: HashMap<String, DeviceRecord>,
     sessions: HashMap<String, UploadSession>,
     stats: RelayStats,
+    pending_approvals: HashMap<String, PendingApproval>,
+    identity: RelayIdentity,
+    outgoing: HashMap<String, Arc<AtomicBool>>,
     udp_handle: Option<tauri::async_runtime::JoinHandle<()>>,
     http_handle: Option<tauri::async_runtime::JoinHandle<()>>,
 }
@@ -236,31 +335,96 @@ struct AxumState {
 
 impl RelayState {
     pub fn load(app: &AppHandle) -> Self {
-        let config = load_config(app).unwrap_or_else(|_| {
+        // The private key lives in the platform credential vault, never relay.json.
+        // If the vault is temporarily unavailable we keep an ephemeral in-memory identity.
+        let identity = load_or_create_identity().unwrap_or_else(|_| {
+            generate_identity().expect("failed to generate LocalSend relay identity")
+        });
+        let mut config = load_config(app).unwrap_or_else(|_| {
             let mut config = RelayConfig::default();
-            config.fingerprint = Uuid::new_v4().to_string();
+            config.fingerprint = identity.fingerprint.clone();
             let _ = save_config(app, &config);
             config
         });
-        let config = if config.fingerprint.is_empty() {
-            let mut config = config;
-            config.fingerprint = Uuid::new_v4().to_string();
+        // HTTPS peers require this value to equal the SHA-256 fingerprint of our
+        // client certificate. This also gives HTTP-only discovery a stable identity.
+        if config.fingerprint != identity.fingerprint {
+            config.fingerprint = identity.fingerprint.clone();
             let _ = save_config(app, &config);
-            config
-        } else {
-            config
-        };
+        }
+        // 旧版本默认自动接收。升级后强制迁移为逐批确认，避免未授权文件落盘。
+        if config.auto_accept {
+            config.auto_accept = false;
+            let _ = save_config(app, &config);
+        }
         Self {
             inner: Arc::new(Mutex::new(RelayInner {
                 config,
                 devices: HashMap::new(),
                 sessions: HashMap::new(),
                 stats: RelayStats::default(),
+                pending_approvals: HashMap::new(),
+                identity,
+                outgoing: HashMap::new(),
                 udp_handle: None,
                 http_handle: None,
             })),
         }
     }
+}
+
+fn relay_credential() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(RELAY_KEYRING_SERVICE, RELAY_KEYRING_USER)
+        .map_err(|error| format!("初始化通讯站身份凭据失败：{error}"))
+}
+
+fn load_or_create_identity() -> Result<RelayIdentity, String> {
+    let credential = relay_credential()?;
+    match credential.get_password() {
+        Ok(value) => {
+            let stored: StoredRelayIdentity = serde_json::from_str(&value)
+                .map_err(|error| format!("通讯站身份格式无效：{error}"))?;
+            identity_from_pem(stored.certificate_pem, stored.private_key_pem)
+        }
+        Err(keyring::Error::NoEntry) => {
+            let identity = generate_identity()?;
+            let stored = StoredRelayIdentity {
+                certificate_pem: identity.certificate_pem.clone(),
+                private_key_pem: identity.private_key_pem.clone(),
+            };
+            let encoded = serde_json::to_string(&stored)
+                .map_err(|error| format!("序列化通讯站身份失败：{error}"))?;
+            credential
+                .set_password(&encoded)
+                .map_err(|error| format!("保存通讯站身份失败：{error}"))?;
+            Ok(identity)
+        }
+        Err(error) => Err(format!("读取通讯站身份失败：{error}")),
+    }
+}
+
+fn generate_identity() -> Result<RelayIdentity, String> {
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["LocalSend User".into()])
+            .map_err(|error| format!("生成通讯站 TLS 身份失败：{error}"))?;
+    identity_from_pem(cert.pem(), key_pair.serialize_pem())
+}
+
+fn identity_from_pem(certificate_pem: String, private_key_pem: String) -> Result<RelayIdentity, String> {
+    let certificate = CertificateDer::from_pem_slice(certificate_pem.as_bytes())
+        .map_err(|error| format!("解析通讯站证书失败：{error}"))?;
+    // Parse the key here as well so a corrupt credential is rejected at startup.
+    PrivateKeyDer::from_pem_slice(private_key_pem.as_bytes())
+        .map_err(|error| format!("解析通讯站私钥失败：{error}"))?;
+    Ok(RelayIdentity {
+        fingerprint: certificate_fingerprint(&certificate),
+        certificate_pem,
+        private_key_pem,
+    })
+}
+
+fn certificate_fingerprint(certificate: &CertificateDer<'_>) -> String {
+    hex::encode_upper(Sha256::digest(certificate.as_ref()))
 }
 
 fn self_device_info(config: &RelayConfig) -> DeviceInfo {
@@ -324,13 +488,16 @@ pub fn get_relay_config(state: tauri::State<'_, RelayState>) -> Result<RelayConf
 pub fn set_relay_config(
     app: AppHandle,
     state: tauri::State<'_, RelayState>,
-    config: RelayConfig,
+    mut config: RelayConfig,
 ) -> Result<RelayConfig, String> {
+    // 安全策略：投递始终逐批确认，不接受旧前端重新开启自动接收。
+    config.auto_accept = false;
     {
         let mut inner = state
             .inner
             .lock()
             .map_err(|_| "星际通讯站暂不可用".to_string())?;
+        config.fingerprint = inner.identity.fingerprint.clone();
         inner.config = config.clone();
         save_config(&app, &inner.config)?;
     }
@@ -340,16 +507,19 @@ pub fn set_relay_config(
 }
 
 #[tauri::command]
-pub fn relay_devices(state: tauri::State<'_, RelayState>) -> Result<Vec<DeviceInfo>, String> {
+pub fn relay_devices(state: tauri::State<'_, RelayState>) -> Result<Vec<RelayDevice>, String> {
     let inner = state.inner.lock().map_err(|_| "星际通讯站暂不可用".to_string())?;
     let now = Instant::now();
-    let mut devices: Vec<DeviceInfo> = inner
+    let mut devices: Vec<RelayDevice> = inner
         .devices
         .iter()
         .filter(|(_, record)| now.duration_since(record.last_seen).as_secs() < DEVICE_TTL_SECS)
-        .map(|(_, record)| record.info.clone())
+        .map(|(_, record)| RelayDevice {
+            info: record.info.clone(),
+            ip: record.ip.to_string(),
+        })
         .collect();
-    devices.sort_by(|a, b| a.alias.cmp(&b.alias));
+    devices.sort_by(|a, b| a.info.alias.cmp(&b.info.alias));
     Ok(devices)
 }
 
@@ -370,6 +540,450 @@ pub fn clear_relay_recent(state: tauri::State<'_, RelayState>) -> Result<(), Str
     let mut inner = state.inner.lock().map_err(|_| "星际通讯站暂不可用".to_string())?;
     inner.stats.recent.clear();
     Ok(())
+}
+
+#[tauri::command]
+pub fn respond_relay_request(
+    state: tauri::State<'_, RelayState>,
+    request_id: String,
+    accept: bool,
+) -> Result<(), String> {
+    let pending = state
+        .inner
+        .lock()
+        .map_err(|_| "星际通讯站暂不可用".to_string())?
+        .pending_approvals
+        .remove(&request_id)
+        .ok_or_else(|| "接收请求已处理或已超时".to_string())?;
+    pending
+        .response
+        .send(accept)
+        .map_err(|_| "接收请求已超时".to_string())
+}
+
+#[tauri::command]
+pub fn start_relay_send(
+    app: AppHandle,
+    state: tauri::State<'_, RelayState>,
+    fingerprint: String,
+    paths: Vec<String>,
+) -> Result<String, String> {
+    if paths.is_empty() {
+        return Err("请先选择要发送的文件".into());
+    }
+    if paths.len() > MAX_RELAY_FILES {
+        return Err(format!("单批最多发送 {MAX_RELAY_FILES} 个文件"));
+    }
+
+    let mut files = Vec::with_capacity(paths.len());
+    let mut total_bytes = 0u64;
+    for path in paths {
+        let path = PathBuf::from(path);
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("{} 不是普通文件", path.display()));
+        }
+        if metadata.len() > MAX_RELAY_FILE_SIZE {
+            return Err(format!("{} 超过单文件 {} 上限", path.display(), human_bytes(MAX_RELAY_FILE_SIZE)));
+        }
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > MAX_RELAY_BATCH_BYTES {
+            return Err(format!("所选文件超过单批 {} 上限", human_bytes(MAX_RELAY_BATCH_BYTES)));
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("无法识别文件名：{}", path.display()))?
+            .to_string();
+        files.push(OutgoingFile {
+            id: Uuid::new_v4().to_string(),
+            path,
+            file_name,
+            size: metadata.len(),
+        });
+    }
+
+    let transfer_id = Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (device, identity, self_info) = {
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| "星际通讯站暂不可用".to_string())?;
+        if !inner.config.enabled {
+            return Err("请先启用星际通讯站".into());
+        }
+        if !inner.outgoing.is_empty() {
+            return Err("已有文件正在发送，请等待完成或先取消".into());
+        }
+        let record = inner
+            .devices
+            .get(&fingerprint)
+            .filter(|record| record.last_seen.elapsed().as_secs() < DEVICE_TTL_SECS)
+            .ok_or_else(|| "目标设备已离线，请刷新后重试".to_string())?;
+        let result = (
+            RelayDevice {
+                info: record.info.clone(),
+                ip: record.ip.to_string(),
+            },
+            inner.identity.clone(),
+            self_device_info(&inner.config),
+        );
+        inner.outgoing.insert(transfer_id.clone(), cancel.clone());
+        result
+    };
+    let relay = state.inner.clone();
+    let task_transfer_id = transfer_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = send_files(
+            &app,
+            &task_transfer_id,
+            &device,
+            &identity,
+            &self_info,
+            &files,
+            total_bytes,
+            &cancel,
+        );
+        if let Err(error) = result {
+            let _ = app.emit(
+                "relay-send-error",
+                serde_json::json!({
+                    "transferId": task_transfer_id,
+                    "target": device.info.alias,
+                    "error": error,
+                    "cancelled": cancel.load(Ordering::Relaxed),
+                }),
+            );
+        }
+        if let Ok(mut inner) = relay.lock() {
+            inner.outgoing.remove(&task_transfer_id);
+        }
+    });
+    Ok(transfer_id)
+}
+
+#[tauri::command]
+pub fn cancel_relay_send(
+    state: tauri::State<'_, RelayState>,
+    transfer_id: String,
+) -> Result<(), String> {
+    let inner = state
+        .inner
+        .lock()
+        .map_err(|_| "星际通讯站暂不可用".to_string())?;
+    let cancel = inner
+        .outgoing
+        .get(&transfer_id)
+        .ok_or_else(|| "发送任务已结束".to_string())?;
+    cancel.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+fn send_files(
+    app: &AppHandle,
+    transfer_id: &str,
+    device: &RelayDevice,
+    identity: &RelayIdentity,
+    self_info: &DeviceInfo,
+    files: &[OutgoingFile],
+    total_bytes: u64,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let agent = relay_agent(device, identity)?;
+    let base_url = relay_base_url(device)?;
+    let metadata = files
+        .iter()
+        .map(|file| {
+            (
+                file.id.clone(),
+                OutgoingFileMeta {
+                    id: file.id.clone(),
+                    file_name: file.file_name.clone(),
+                    size: file.size,
+                    file_type: "application/octet-stream".into(),
+                },
+            )
+        })
+        .collect();
+    let request = OutgoingPrepareRequest {
+        info: self_info.clone(),
+        files: metadata,
+    };
+    let body = serde_json::to_string(&request)
+        .map_err(|error| format!("无法生成发送请求：{error}"))?;
+    let _ = app.emit(
+        "relay-send-progress",
+        serde_json::json!({
+            "transferId": transfer_id,
+            "target": device.info.alias,
+            "filename": files.first().map(|file| file.file_name.as_str()).unwrap_or(""),
+            "fileIndex": 0,
+            "fileCount": files.len(),
+            "sent": 0,
+            "totalSent": 0,
+            "totalBytes": total_bytes,
+            "phase": "waiting",
+        }),
+    );
+    let response = agent
+        .post(&format!("{base_url}/api/localsend/v2/prepare-upload"))
+        .set("Content-Type", "application/json")
+        .send_string(&body)
+        .map_err(format_send_error)?;
+    let response_body = response
+        .into_string()
+        .map_err(|error| format!("读取目标设备发送许可失败：{error}"))?;
+    let prepared: OutgoingPrepareResponse = serde_json::from_str(&response_body)
+        .map_err(|error| format!("目标设备返回了无效的发送许可：{error}"))?;
+
+    let mut total_sent = 0u64;
+    for (index, file) in files.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            cancel_remote(&agent, &base_url, &prepared.session_id);
+            return Err("发送已取消".into());
+        }
+        let Some(token) = prepared.files.get(&file.id) else {
+            cancel_remote(&agent, &base_url, &prepared.session_id);
+            return Err(format!("目标设备没有接受 {}", file.file_name));
+        };
+        let source = match fs::File::open(&file.path) {
+            Ok(source) => source,
+            Err(error) => {
+                cancel_remote(&agent, &base_url, &prepared.session_id);
+                return Err(format!("无法打开 {}：{error}", file.file_name));
+            }
+        };
+        let reader = ProgressReader {
+            source,
+            app: app.clone(),
+            transfer_id: transfer_id.to_string(),
+            target: device.info.alias.clone(),
+            filename: file.file_name.clone(),
+            file_index: index + 1,
+            file_count: files.len(),
+            file_size: file.size,
+            total_before: total_sent,
+            total_bytes,
+            sent: 0,
+            last_emit: 0,
+            cancel: cancel.clone(),
+        };
+        let upload_result = agent
+            .post(&format!("{base_url}/api/localsend/v2/upload"))
+            .query("sessionId", &prepared.session_id)
+            .query("fileId", &file.id)
+            .query("token", token)
+            .set("Content-Type", "application/octet-stream")
+            .set("Content-Length", &file.size.to_string())
+            .send(reader);
+        if cancel.load(Ordering::Relaxed) {
+            cancel_remote(&agent, &base_url, &prepared.session_id);
+            return Err("发送已取消".into());
+        }
+        if let Err(error) = upload_result {
+            cancel_remote(&agent, &base_url, &prepared.session_id);
+            return Err(format_send_error(error));
+        }
+        total_sent = total_sent.saturating_add(file.size);
+    }
+
+    let _ = app.emit(
+        "relay-send-complete",
+        serde_json::json!({
+            "transferId": transfer_id,
+            "target": device.info.alias,
+            "fileCount": files.len(),
+            "totalBytes": total_bytes,
+        }),
+    );
+    Ok(())
+}
+
+fn relay_base_url(device: &RelayDevice) -> Result<String, String> {
+    let protocol = device.info.protocol.to_ascii_lowercase();
+    if protocol != "http" && protocol != "https" {
+        return Err(format!("目标设备使用了不支持的协议：{}", device.info.protocol));
+    }
+    let ip: IpAddr = device.ip.parse().map_err(|_| "目标设备地址无效".to_string())?;
+    let host = match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    Ok(format!("{protocol}://{host}:{}", device.info.port))
+}
+
+fn relay_agent(device: &RelayDevice, identity: &RelayIdentity) -> Result<ureq::Agent, String> {
+    let builder = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(SEND_CONNECT_TIMEOUT_SECS))
+        .timeout_read(Duration::from_secs(SEND_REQUEST_TIMEOUT_SECS))
+        .timeout_write(Duration::from_secs(SEND_REQUEST_TIMEOUT_SECS));
+    if !device.info.protocol.eq_ignore_ascii_case("https") {
+        return Ok(builder.build());
+    }
+
+    let certificate = CertificateDer::from_pem_slice(identity.certificate_pem.as_bytes())
+        .map_err(|error| format!("解析通讯站证书失败：{error}"))?;
+    let private_key = PrivateKeyDer::from_pem_slice(identity.private_key_pem.as_bytes())
+        .map_err(|error| format!("解析通讯站私钥失败：{error}"))?;
+    let expected = normalize_fingerprint(&device.info.fingerprint)?;
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(certificate.clone())
+        .map_err(|error| format!("初始化 TLS 验证器失败：{error}"))?;
+    let signature_verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|error| format!("初始化 TLS 签名验证器失败：{error}"))?;
+    let verifier = Arc::new(PinnedServerCertVerifier {
+        expected,
+        signature_verifier,
+    });
+    let tls = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(vec![certificate], private_key)
+        .map_err(|error| format!("初始化客户端 TLS 身份失败：{error}"))?;
+    Ok(builder.tls_config(Arc::new(tls)).build())
+}
+
+fn normalize_fingerprint(value: &str) -> Result<Vec<u8>, String> {
+    let normalized: String = value
+        .chars()
+        .filter(|character| !matches!(character, ':' | '-' | ' '))
+        .collect();
+    let decoded = hex::decode(&normalized)
+        .map_err(|_| "目标设备的证书指纹格式无效".to_string())?;
+    if decoded.len() != 32 {
+        return Err("目标设备的证书指纹不是 SHA-256".into());
+    }
+    Ok(decoded)
+}
+
+#[derive(Debug)]
+struct PinnedServerCertVerifier {
+    expected: Vec<u8>,
+    signature_verifier: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for PinnedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        let actual = Sha256::digest(end_entity.as_ref());
+        if actual.as_slice() != self.expected.as_slice() {
+            return Err(RustlsError::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.signature_verifier
+            .verify_tls12_signature(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.signature_verifier
+            .verify_tls13_signature(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.signature_verifier.supported_verify_schemes()
+    }
+}
+
+struct ProgressReader {
+    source: fs::File,
+    app: AppHandle,
+    transfer_id: String,
+    target: String,
+    filename: String,
+    file_index: usize,
+    file_count: usize,
+    file_size: u64,
+    total_before: u64,
+    total_bytes: u64,
+    sent: u64,
+    last_emit: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Read for ProgressReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "relay send cancelled"));
+        }
+        let count = self.source.read(buffer)?;
+        self.sent = self.sent.saturating_add(count as u64);
+        if count == 0 || self.sent >= self.last_emit.saturating_add(PROGRESS_EMIT_BYTES) {
+            let _ = self.app.emit(
+                "relay-send-progress",
+                serde_json::json!({
+                    "transferId": self.transfer_id,
+                    "target": self.target,
+                    "filename": self.filename,
+                    "fileIndex": self.file_index,
+                    "fileCount": self.file_count,
+                    "sent": self.sent,
+                    "fileSize": self.file_size,
+                    "totalSent": self.total_before.saturating_add(self.sent),
+                    "totalBytes": self.total_bytes,
+                    "phase": "uploading",
+                }),
+            );
+            self.last_emit = self.sent;
+        }
+        Ok(count)
+    }
+}
+
+fn cancel_remote(agent: &ureq::Agent, base_url: &str, session_id: &str) {
+    let _ = agent
+        .post(&format!("{base_url}/api/localsend/v2/cancel"))
+        .query("sessionId", session_id)
+        .call();
+}
+
+fn format_send_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(403, _) => "对方拒绝了发送请求".into(),
+        ureq::Error::Status(409, _) => "对方正在处理另一项传输，请稍后重试".into(),
+        ureq::Error::Status(429, _) => "对方请求过于频繁，请稍后重试".into(),
+        ureq::Error::Status(code, response) => {
+            let detail = response.into_string().unwrap_or_default();
+            if detail.trim().is_empty() {
+                format!("目标设备返回错误 {code}")
+            } else {
+                format!("目标设备返回错误 {code}：{}", detail.trim())
+            }
+        }
+        ureq::Error::Transport(error) => {
+            let message = error.to_string();
+            if message.to_ascii_lowercase().contains("certificate") {
+                "目标设备的 TLS 证书与发现指纹不一致，已阻止发送".into()
+            } else {
+                format!("无法连接目标设备：{message}")
+            }
+        }
+    }
 }
 
 // ─── 服务启停 ───────────────────────────────────────────────────────────
@@ -399,6 +1013,10 @@ pub fn start(app: AppHandle, state: &RelayState) {
 
 fn stop(state: &RelayState) {
     if let Ok(mut inner) = state.inner.lock() {
+        inner.pending_approvals.clear();
+        for cancel in inner.outgoing.values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(handle) = inner.udp_handle.take() {
             handle.abort();
         }
@@ -416,6 +1034,7 @@ fn router(state: AxumState) -> Router {
         .route("/api/localsend/v2/register", post(register))
         .route("/api/localsend/v2/prepare-upload", post(prepare_upload))
         .route("/api/localsend/v2/upload", post(upload))
+        .route("/api/localsend/v2/cancel", post(cancel_upload))
         .route("/api/localsend/v2/cancel-upload", post(cancel_upload))
         .with_state(state)
 }
@@ -436,7 +1055,12 @@ async fn http_serve(state: AxumState, port: u16) {
         serde_json::json!({ "running": true, "port": port, "error": null }),
     );
     let app = router(state.clone());
-    if let Err(error) = axum::serve(listener, app).await {
+    if let Err(error) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    {
         let _ = state.app.emit(
             "relay-status",
             serde_json::json!({ "running": false, "port": port, "error": format!("服务停止：{error}") }),
@@ -456,6 +1080,7 @@ async fn info(State(state): State<AxumState>) -> impl IntoResponse {
 /// 本机据此把对方加入设备列表。响应返回本机精简信息。
 async fn register(
     State(state): State<AxumState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(payload): Json<DeviceInfo>,
 ) -> impl IntoResponse {
     if !payload.fingerprint.is_empty() {
@@ -470,6 +1095,7 @@ async fn register(
             payload.fingerprint.clone(),
             DeviceRecord {
                 info: payload.clone(),
+                ip: peer.ip(),
                 last_seen: Instant::now(),
             },
         );
@@ -491,15 +1117,16 @@ async fn prepare_upload(
     State(state): State<AxumState>,
     Json(req): Json<PrepareUploadRequest>,
 ) -> impl IntoResponse {
-    let mut inner = match state.relay.lock() {
-        Ok(inner) => inner,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "状态暂不可用").into_response(),
-    };
-    if !inner.config.enabled {
-        return (StatusCode::FORBIDDEN, "星际通讯站未启用").into_response();
-    }
-    if !inner.config.auto_accept {
-        return (StatusCode::FORBIDDEN, "需要手动确认，暂未开放").into_response();
+    {
+        let inner = match state.relay.lock() {
+            Ok(inner) => inner,
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "状态暂不可用").into_response()
+            }
+        };
+        if !inner.config.enabled {
+            return (StatusCode::FORBIDDEN, "星际通讯站未启用").into_response();
+        }
     }
     if req.files.len() > MAX_RELAY_FILES {
         return (
@@ -526,6 +1153,57 @@ async fn prepare_upload(
                 .into_response();
         }
     }
+
+    let request_id = Uuid::new_v4().to_string();
+    let incoming = IncomingRequest {
+        request_id: request_id.clone(),
+        sender: req.info.alias.clone(),
+        files: req
+            .files
+            .values()
+            .map(|file| IncomingFile {
+                file_name: file.file_name.clone(),
+                size: file.size,
+            })
+            .collect(),
+        total_bytes: total,
+        expires_in_seconds: APPROVAL_TIMEOUT_SECS,
+    };
+    let (approval_tx, approval_rx) = oneshot::channel();
+    {
+        let mut inner = match state.relay.lock() {
+            Ok(inner) => inner,
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "状态暂不可用").into_response()
+            }
+        };
+        inner.pending_approvals.insert(
+            request_id.clone(),
+            PendingApproval {
+                response: approval_tx,
+            },
+        );
+    }
+    let _ = state.app.emit("relay-incoming-request", &incoming);
+    let approved = matches!(
+        tokio::time::timeout(Duration::from_secs(APPROVAL_TIMEOUT_SECS), approval_rx).await,
+        Ok(Ok(true))
+    );
+    if !approved {
+        if let Ok(mut inner) = state.relay.lock() {
+            inner.pending_approvals.remove(&request_id);
+        }
+        let _ = state.app.emit(
+            "relay-incoming-expired",
+            serde_json::json!({ "requestId": request_id }),
+        );
+        return (StatusCode::FORBIDDEN, "接收请求被拒绝或已超时").into_response();
+    }
+
+    let mut inner = match state.relay.lock() {
+        Ok(inner) => inner,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "状态暂不可用").into_response(),
+    };
     let session_id = Uuid::new_v4().to_string();
     let mut tokens: HashMap<String, String> = HashMap::new();
     for (id, meta) in req.files {
@@ -687,8 +1365,16 @@ use tokio::net::TcpListener;
 /// 在每个非环回 IPv4 接口上绑定并加入多播组的 socket。
 struct BoundSocket {
     socket: Arc<UdpSocket>,
-    target: SocketAddr,
+    targets: Vec<SocketAddr>,
     description: String,
+}
+
+fn discovery_targets(port: u16, broadcast: Option<Ipv4Addr>) -> Vec<SocketAddr> {
+    let mut targets = vec![SocketAddr::V4(SocketAddrV4::new(MULTICAST_GROUP, port))];
+    if let Some(broadcast) = broadcast {
+        targets.push(SocketAddr::V4(SocketAddrV4::new(broadcast, port)));
+    }
+    targets
 }
 
 fn bind_multicast_socket_v4(
@@ -699,6 +1385,8 @@ fn bind_multicast_socket_v4(
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     // 所有 socket 共用同一端口；Windows 无 SO_REUSEPORT，仅 SO_REUSEADDR。
     socket.set_reuse_address(true)?;
+    // 某些 Wi-Fi/AP 会过滤多播；允许向接口的定向广播地址发送相同 announce 作为兜底。
+    socket.set_broadcast(true)?;
     // bind 通配地址，使 socket 能在匹配目的地址的平台上接收多播数据报。
     socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
     socket.join_multicast_v4(&group, &interface)?;
@@ -728,10 +1416,10 @@ async fn udp_loop(state: AxumState, port: u16) {
             match bind_multicast_socket_v4(MULTICAST_GROUP, port, ip) {
                 Ok(socket) => {
                     let description = format!("{} ({})", iface.name, ip);
-                    let target = SocketAddr::V4(SocketAddrV4::new(MULTICAST_GROUP, port));
+                    let targets = discovery_targets(port, v4.broadcast);
                     sockets.push(BoundSocket {
                         socket: Arc::new(socket),
-                        target,
+                        targets,
                         description,
                     });
                 }
@@ -776,7 +1464,9 @@ async fn udp_loop(state: AxumState, port: u16) {
                 let message = AnnouncedMessage { info, announce: true };
                 if let Ok(payload) = serde_json::to_vec(&message) {
                     for bound in &sockets {
-                        let _ = bound.socket.send_to(&payload, bound.target).await;
+                        for target in &bound.targets {
+                            let _ = bound.socket.send_to(&payload, target).await;
+                        }
                     }
                 }
             }
@@ -824,6 +1514,7 @@ async fn recv_loop(
                 info.fingerprint.clone(),
                 DeviceRecord {
                     info: info.clone(),
+                    ip: src.ip(),
                     last_seen: Instant::now(),
                 },
             );
@@ -987,5 +1678,106 @@ mod tests {
         assert!(json.contains("\"announce\":true"));
         assert!(json.contains("\"fingerprint\":\"fp\""));
         assert!(json.contains("\"version\":\"2.2\""));
+    }
+
+    #[test]
+    fn discovery_uses_multicast_and_directed_broadcast() {
+        let targets = discovery_targets(53317, Some(Ipv4Addr::new(192, 168, 15, 255)));
+        assert_eq!(
+            targets,
+            vec![
+                "224.0.0.167:53317".parse().unwrap(),
+                "192.168.15.255:53317".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_never_auto_accepts_by_default() {
+        assert!(!RelayConfig::default().auto_accept);
+        assert!(!default_auto_accept());
+    }
+
+    fn test_device(protocol: &str, ip: &str, fingerprint: &str) -> RelayDevice {
+        RelayDevice {
+            info: DeviceInfo {
+                alias: "Nearby device".into(),
+                version: "2.2".into(),
+                device_model: "test".into(),
+                device_type: "desktop".into(),
+                fingerprint: fingerprint.into(),
+                port: 53317,
+                protocol: protocol.into(),
+                download: false,
+            },
+            ip: ip.into(),
+        }
+    }
+
+    #[test]
+    fn builds_safe_ipv4_and_ipv6_peer_urls() {
+        assert_eq!(
+            relay_base_url(&test_device("https", "192.168.14.140", "fp")).unwrap(),
+            "https://192.168.14.140:53317"
+        );
+        assert_eq!(
+            relay_base_url(&test_device("http", "fe80::1", "fp")).unwrap(),
+            "http://[fe80::1]:53317"
+        );
+        assert!(relay_base_url(&test_device("file", "192.168.14.140", "fp")).is_err());
+    }
+
+    #[test]
+    fn normalizes_sha256_fingerprints_but_rejects_invalid_values() {
+        let raw = "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF";
+        let separated = raw
+            .as_bytes()
+            .chunks(2)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        assert_eq!(normalize_fingerprint(raw).unwrap(), normalize_fingerprint(&separated).unwrap());
+        assert!(normalize_fingerprint("not-a-fingerprint").is_err());
+        assert!(normalize_fingerprint("0011").is_err());
+    }
+
+    #[test]
+    fn generated_identity_matches_its_certificate_fingerprint() {
+        let identity = generate_identity().expect("generate identity");
+        let certificate = CertificateDer::from_pem_slice(identity.certificate_pem.as_bytes())
+            .expect("parse certificate");
+        assert_eq!(identity.fingerprint, certificate_fingerprint(&certificate));
+        assert_eq!(identity.fingerprint.len(), 64);
+        assert!(identity.fingerprint.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_eq!(identity.fingerprint, identity.fingerprint.to_ascii_uppercase());
+    }
+
+    #[test]
+    fn pinned_verifier_accepts_only_the_discovered_certificate() {
+        let identity = generate_identity().expect("generate identity");
+        let certificate = CertificateDer::from_pem_slice(identity.certificate_pem.as_bytes())
+            .expect("parse certificate");
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate.clone()).expect("add verifier root");
+        let signature_verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("build signature verifier");
+        let server_name = ServerName::try_from("localhost").expect("server name");
+        let now = UnixTime::since_unix_epoch(Duration::from_secs(0));
+        let matching = PinnedServerCertVerifier {
+            expected: normalize_fingerprint(&identity.fingerprint).unwrap(),
+            signature_verifier: signature_verifier.clone(),
+        };
+        assert!(matching
+            .verify_server_cert(&certificate, &[], &server_name, &[], now)
+            .is_ok());
+
+        let mismatched = PinnedServerCertVerifier {
+            expected: vec![0; 32],
+            signature_verifier,
+        };
+        assert!(mismatched
+            .verify_server_cert(&certificate, &[], &server_name, &[], now)
+            .is_err());
     }
 }

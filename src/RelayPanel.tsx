@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { FolderOpen, RadioTower, RefreshCw, Save, Trash2 } from "lucide-react";
+import { FolderOpen, RadioTower, RefreshCw, Save, Send, Trash2 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   RelayConfig,
@@ -153,6 +153,20 @@ const browseBtnStyle: CSSProperties = {
   whiteSpace: "nowrap",
 };
 
+const sendBtnStyle = (disabled: boolean): CSSProperties => ({
+  width: 27,
+  height: 24,
+  flex: "0 0 auto",
+  display: "grid",
+  placeItems: "center",
+  padding: 0,
+  borderRadius: 6,
+  border: "1px solid rgba(137, 180, 250, 0.25)",
+  background: disabled ? "rgba(255,255,255,0.04)" : "rgba(137, 180, 250, 0.14)",
+  color: disabled ? "rgba(205,214,244,0.35)" : "#89b4fa",
+  cursor: disabled ? "wait" : "pointer",
+});
+
 export function RelayPanel() {
   const [config, setConfig] = useState<RelayConfig | null>(null);
   const [devices, setDevices] = useState<RelayDeviceInfo[]>([]);
@@ -162,6 +176,14 @@ export function RelayPanel() {
   const [draftAlias, setDraftAlias] = useState("");
   const [draftDestination, setDraftDestination] = useState("");
   const [saving, setSaving] = useState(false);
+  const [sendingFingerprint, setSendingFingerprint] = useState<string | null>(null);
+  const toastTimer = useRef<number | undefined>(undefined);
+
+  const showToast = useCallback((message: string, duration = 5000) => {
+    setToast(message);
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), duration);
+  }, []);
 
   const reload = useCallback(async () => {
     try {
@@ -191,40 +213,36 @@ export function RelayPanel() {
   }, [config]);
 
   useEffect(() => {
-    const unlistens: UnlistenFn[] = [];
-    let toastTimer: number | undefined;
-    (async () => {
-      unlistens.push(
-        await listen<RelayStatusEvent>("relay-status", (event) => {
+    let disposed = false;
+    let cleanup: UnlistenFn[] = [];
+    void Promise.all([
+      listen<RelayStatusEvent>("relay-status", (event) => {
           setStatus(event.payload);
           void reload();
         }),
-      );
-      unlistens.push(
-        await listen("relay-device-discovered", () => void reload()),
-      );
-      unlistens.push(
-        await listen<RelayTransferComplete>("relay-transfer-complete", (event) => {
+      listen("relay-device-discovered", () => void reload()),
+      listen<RelayTransferComplete>("relay-transfer-complete", (event) => {
           const payload = event.payload;
-          setToast(`收到 ${payload.filename} · ${formatBytes(payload.bytes)} · 来自 ${payload.sender}`);
-          window.clearTimeout(toastTimer);
-          toastTimer = window.setTimeout(() => setToast(null), 5000);
+          showToast(`收到 ${payload.filename} · ${formatBytes(payload.bytes)} · 来自 ${payload.sender}`);
           void reload();
         }),
-      );
-      unlistens.push(
-        await listen<{ error?: string }>("relay-transfer-error", (event) => {
-          setToast(`投递失败：${event.payload?.error ?? "未知错误"}`);
-          window.clearTimeout(toastTimer);
-          toastTimer = window.setTimeout(() => setToast(null), 5000);
+      listen<{ error?: string }>("relay-transfer-error", (event) => {
+          showToast(`投递失败：${event.payload?.error ?? "未知错误"}`);
         }),
-      );
-    })();
+    ])
+      .then((unlistens) => {
+        if (disposed) unlistens.forEach((unlisten) => unlisten());
+        else cleanup = unlistens;
+      })
+      .catch(() => {
+        // Tauri event bridge unavailable outside the desktop runtime.
+      });
     return () => {
-      unlistens.forEach((unlisten) => unlisten());
-      window.clearTimeout(toastTimer);
+      disposed = true;
+      cleanup.forEach((unlisten) => unlisten());
+      window.clearTimeout(toastTimer.current);
     };
-  }, [reload]);
+  }, [reload, showToast]);
 
   useEffect(() => {
     if (!config?.enabled) return;
@@ -252,8 +270,7 @@ export function RelayPanel() {
         destination: draftDestination.trim() || config.destination,
       };
       setConfig(await invoke<RelayConfig>("set_relay_config", { config: next }));
-      setToast("设置已保存");
-      window.setTimeout(() => setToast(null), 2500);
+      showToast("设置已保存", 2500);
     } catch {
       // 忽略；reload 会拉回。
     } finally {
@@ -272,6 +289,29 @@ export function RelayPanel() {
       await reload();
     } catch {
       // 忽略。
+    }
+  };
+
+  const sendToDevice = async (device: RelayDeviceInfo) => {
+    if (sendingFingerprint) return;
+    setSendingFingerprint(device.fingerprint);
+    try {
+      const picked = await open({
+        multiple: true,
+        directory: false,
+        title: `发送文件到 ${device.alias || "邻近设备"}`,
+      });
+      const paths = typeof picked === "string" ? [picked] : picked;
+      if (!paths?.length) return;
+      await invoke<string>("start_relay_send", {
+        fingerprint: device.fingerprint,
+        paths,
+      });
+      showToast(`已向 ${device.alias || "目标设备"} 发起发送，请等待对方确认`);
+    } catch (error) {
+      showToast(`无法发送：${String(error)}`);
+    } finally {
+      setSendingFingerprint(null);
     }
   };
 
@@ -373,10 +413,23 @@ export function RelayPanel() {
             )}
             {devices.map((device) => (
               <div key={device.fingerprint} style={itemStyle}>
-                <span>{device.alias || "未命名设备"}</span>
-                <span style={{ opacity: 0.5, fontSize: 10 }}>
-                  {device.deviceType}
+                <span style={{ minWidth: 0, flex: 1 }} title={`${device.ip}:${device.port}`}>
+                  <span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {device.alias || "未命名设备"}
+                  </span>
+                  <span style={{ display: "block", opacity: 0.45, fontSize: 9 }}>
+                    {device.deviceType} · {device.ip}
+                  </span>
                 </span>
+                <button
+                  style={sendBtnStyle(sendingFingerprint !== null)}
+                  disabled={sendingFingerprint !== null}
+                  title={`发送文件到 ${device.alias || "该设备"}`}
+                  aria-label={`发送文件到 ${device.alias || "该设备"}`}
+                  onClick={() => void sendToDevice(device)}
+                >
+                  <Send size={12} />
+                </button>
               </div>
             ))}
           </div>

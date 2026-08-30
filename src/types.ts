@@ -268,6 +268,7 @@ export interface RelayDeviceInfo {
   deviceModel: string;
   deviceType: string;
   download: boolean;
+  ip: string;
 }
 
 export interface RelayRecentRecord {
@@ -297,6 +298,60 @@ export interface RelayTransferComplete {
   bytes: number;
   sender: string;
   destination: string;
+}
+
+export interface RelayIncomingFile {
+  fileName: string;
+  size: number;
+}
+
+export interface RelayIncomingRequest {
+  requestId: string;
+  sender: string;
+  files: RelayIncomingFile[];
+  totalBytes: number;
+  expiresInSeconds: number;
+}
+
+export type RelaySendPhase = "waiting" | "uploading" | "cancelling" | "complete" | "error";
+
+export interface RelaySendProgress {
+  transferId: string;
+  target: string;
+  filename: string;
+  fileIndex: number;
+  fileCount: number;
+  sent: number;
+  fileSize?: number;
+  totalSent: number;
+  totalBytes: number;
+  phase: "waiting" | "uploading";
+}
+
+export interface RelaySendComplete {
+  transferId: string;
+  target: string;
+  fileCount: number;
+  totalBytes: number;
+}
+
+export interface RelaySendError {
+  transferId: string;
+  target: string;
+  error: string;
+  cancelled: boolean;
+}
+
+export interface RelaySendState {
+  transferId: string;
+  target: string;
+  filename: string;
+  fileIndex: number;
+  fileCount: number;
+  totalSent: number;
+  totalBytes: number;
+  phase: RelaySendPhase;
+  error?: string;
 }
 
 export interface RelayStatusEvent {

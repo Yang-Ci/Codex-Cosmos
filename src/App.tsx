@@ -65,6 +65,8 @@ import { describeWeather, fetchWeather, searchLocations } from "./weather";
 import { BlackHoleCanvas } from "./BlackHoleCanvas";
 import { DesktopEcosystem } from "./DesktopEcosystem";
 import { RelayPanel } from "./RelayPanel";
+import { RelayIncomingPrompt, useRelayIncomingRequests } from "./RelayIncomingPrompt";
+import { RelaySendStatus, useRelaySendStatus } from "./RelaySendStatus";
 import type {
   BalanceDetailsSnapshot,
   BalancePreset,
@@ -195,8 +197,8 @@ const mockPulse: PulseData = {
     sampledAt: new Date().toISOString(),
     planType: "plus",
     limitId: "codex",
-    primary: { usedPercent: 35, remainingPercent: 65, windowMinutes: 10080, resetsAt: Date.now() / 1000 + 582000 },
-    secondary: null,
+    primary: { usedPercent: 42, remainingPercent: 58, windowMinutes: 300, resetsAt: Date.now() / 1000 + 10800 },
+    secondary: { usedPercent: 35, remainingPercent: 65, windowMinutes: 10080, resetsAt: Date.now() / 1000 + 582000 },
     source: "local-session",
     stale: false,
   },
@@ -640,11 +642,14 @@ function UsageMeter({
 }
 
 function App() {
+  const relayIncoming = useRelayIncomingRequests();
+  const relaySend = useRelaySendStatus();
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const [now, setNow] = useState(new Date());
   const [pulse, setPulse] = useState<PulseData | null>(null);
   const [weather, setWeather] = useState<WeatherState | null>(loadCachedWeather);
   const [loadingQuota, setLoadingQuota] = useState(false);
+  const [quotaTrendWindow, setQuotaTrendWindow] = useState<"primary" | "secondary">("secondary");
   const [loadingWeather, setLoadingWeather] = useState(false);
   const [weatherError, setWeatherError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1110,18 +1115,28 @@ function App() {
 
   useEffect(() => {
     if (!isTauri || !pulse?.quota) return;
-    const remaining = pulse.quota.primary.remainingPercent;
-    const noticeKey = `quota-notice-${pulse.quota.primary.resetsAt}`;
-    if (remaining > settings.lowQuotaThreshold || localStorage.getItem(noticeKey)) return;
+    const windows = [
+      { label: formatWindow(pulse.quota.primary.windowMinutes), window: pulse.quota.primary },
+      ...(pulse.quota.secondary
+        ? [{ label: "周额度", window: pulse.quota.secondary }]
+        : []),
+    ];
+    const pendingNotices = windows.filter(({ label, window }) => {
+      const noticeKey = `quota-notice-${label}-${window.resetsAt}`;
+      return window.remainingPercent <= settings.lowQuotaThreshold && !localStorage.getItem(noticeKey);
+    });
+    if (pendingNotices.length === 0) return;
     void (async () => {
       let allowed = await isPermissionGranted();
       if (!allowed) allowed = (await requestPermission()) === "granted";
       if (allowed) {
-        sendNotification({
-          title: "Codex 额度提醒",
-          body: `当前周期仅剩 ${Math.round(remaining)}%，${formatReset(pulse.quota!.primary.resetsAt, new Date())}。`,
+        pendingNotices.forEach(({ label, window }) => {
+          sendNotification({
+            title: `Codex ${label}提醒`,
+            body: `仅剩 ${Math.round(window.remainingPercent)}%，${formatReset(window.resetsAt, new Date())}。`,
+          });
+          localStorage.setItem(`quota-notice-${label}-${window.resetsAt}`, "1");
         });
-        localStorage.setItem(noticeKey, "1");
       }
     })();
   }, [pulse, settings.lowQuotaThreshold]);
@@ -1884,7 +1899,19 @@ function App() {
   const quota = pulse?.quota;
   const remaining = Math.round(quota?.primary.remainingPercent ?? 0);
   const accentClass = remaining <= 10 ? "danger" : remaining <= 25 ? "warning" : "healthy";
-  const quotaTrend = useMemo(() => buildQuotaTrend(pulse?.history ?? []), [pulse?.history]);
+  const weeklyQuota = quota?.secondary ?? null;
+  const weeklyRemaining = Math.round(weeklyQuota?.remainingPercent ?? 0);
+  const weeklyAccentClass = weeklyRemaining <= 10 ? "danger" : weeklyRemaining <= 25 ? "warning" : "healthy";
+  const selectedTrendWindow = quotaTrendWindow === "secondary" && weeklyQuota
+    ? weeklyQuota
+    : quota?.primary;
+  const selectedTrendHistory = useMemo(
+    () => (pulse?.history ?? []).filter(
+      (point) => selectedTrendWindow != null && point.windowMinutes === selectedTrendWindow.windowMinutes,
+    ),
+    [pulse?.history, selectedTrendWindow?.windowMinutes],
+  );
+  const quotaTrend = useMemo(() => buildQuotaTrend(selectedTrendHistory), [selectedTrendHistory]);
 
   const formatQuotaTrendAxis = (timestamp: number) => new Date(timestamp * 1000).toLocaleString(
     "zh-CN",
@@ -1978,6 +2005,8 @@ function App() {
           {...terrainProps}
         />
         {renderClipboardPanel()}
+        <RelaySendStatus {...relaySend} />
+        <RelayIncomingPrompt {...relayIncoming} />
       </main>
     );
   }
@@ -2017,17 +2046,24 @@ function App() {
           <div className="compact-divider" />
           <div className={`compact-quota ${accentClass}`}>
             <div className="mini-ring" style={{ "--progress": `${remaining * 3.6}deg` } as React.CSSProperties}><span>{remaining}%</span></div>
-            <div><strong>Codex 剩余</strong><span>{quota ? formatReset(quota.primary.resetsAt, now) : "等待本地数据"}</span></div>
+            <div>
+              <strong>{quota ? `${formatWindow(quota.primary.windowMinutes)}剩余` : "Codex 剩余"}</strong>
+              <span>{weeklyQuota ? `周额度 ${weeklyRemaining}% · ${formatReset(weeklyQuota.resetsAt, now)}` : quota ? formatReset(quota.primary.resetsAt, now) : "等待本地数据"}</span>
+            </div>
           </div>
           <button className="icon-button compact-expand" onClick={() => updateSize("standard")} title="展开"><Maximize2 size={15} /></button>
         </div>
         {renderClipboardPanel()}
+        <RelaySendStatus {...relaySend} />
+        <RelayIncomingPrompt {...relayIncoming} />
       </main>
     );
   }
 
   return (
     <main className={`app ${settings.size} surface-${settings.surfaceStyle}`} data-theme={weather?.isDay === false ? "night" : "day"}>
+      <RelaySendStatus {...relaySend} />
+      <RelayIncomingPrompt {...relayIncoming} />
       {dropState.phase !== "idle" && (
         <div className={`drop-overlay drop-overlay-${dropState.phase}`}>
           {dropState.phase === "ready" && <DropTargetGuide target={dropState.target} />}
@@ -2185,6 +2221,16 @@ function App() {
               <p>{quota ? formatReset(quota.primary.resetsAt, now) : pulse?.error ?? "完成一次 Codex 消息后自动同步"}</p>
               <div className="bar"><i style={{ width: `${quota?.primary.usedPercent ?? 0}%` }} /></div>
               <small>已使用 {quota ? `${quota.primary.usedPercent.toFixed(1)}%` : "--"}</small>
+              {weeklyQuota && (
+                <div className={`quota-secondary ${weeklyAccentClass}`}>
+                  <div className="quota-secondary-head">
+                    <span>周额度 · {formatWindow(weeklyQuota.windowMinutes)}</span>
+                    <strong>{weeklyRemaining}% 剩余</strong>
+                  </div>
+                  <div className="bar"><i style={{ width: `${weeklyQuota.usedPercent}%` }} /></div>
+                  <small>{formatReset(weeklyQuota.resetsAt, now)} · 已使用 {weeklyQuota.usedPercent.toFixed(1)}%</small>
+                </div>
+              )}
             </div>
           </div>
           <div className="quota-metrics">
@@ -2197,7 +2243,23 @@ function App() {
         {settings.size === "expanded" && (
           <section className="expanded-grid">
             <div className="panel trend-panel">
-              <div className="panel-title"><span>Codex 额度使用趋势</span><small>当前 7 天周期 · 本地采样</small></div>
+              <div className="panel-title quota-trend-title">
+                <span>Codex 额度使用趋势</span>
+                <div className="quota-trend-switch" role="group" aria-label="切换额度趋势窗口">
+                  <button
+                    type="button"
+                    className={quotaTrendWindow === "primary" || !weeklyQuota ? "active" : ""}
+                    onClick={() => setQuotaTrendWindow("primary")}
+                  >{quota ? formatWindow(quota.primary.windowMinutes).replace("周期", "").trim() : "5 小时"}</button>
+                  {weeklyQuota && (
+                    <button
+                      type="button"
+                      className={quotaTrendWindow === "secondary" ? "active" : ""}
+                      onClick={() => setQuotaTrendWindow("secondary")}
+                    >周额度</button>
+                  )}
+                </div>
+              </div>
               <ResponsiveContainer width="100%" height={136}>
                 <AreaChart data={quotaTrend.data} margin={{ top: 12, right: 4, left: 0, bottom: 0 }}>
                   <defs><linearGradient id="quotaFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#68e3b5" stopOpacity={0.34}/><stop offset="1" stopColor="#68e3b5" stopOpacity={0}/></linearGradient></defs>
