@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -301,9 +301,9 @@ fn move_one(source: &Path, destination: &Path) -> Result<String, String> {
             }
             fs::remove_dir_all(source).map_err(|error| format!("复制完成但无法移除原目录：{error}"))?;
         } else {
-            if let Err(error) = fs::copy(source, &target) {
+            if let Err(error) = copy_file_contents(source, &target) {
                 let _ = fs::remove_file(&target);
-                return Err(format!("跨磁盘复制失败：{error}"));
+                return Err(error);
             }
             fs::remove_file(source).map_err(|error| format!("复制完成但无法移除原文件：{error}"))?;
         }
@@ -428,7 +428,7 @@ fn remove_output(path: &Path) {
 }
 
 fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
-    fs::create_dir_all(target).map_err(|error| format!("无法创建目标目录：{error}"))?;
+    fs::create_dir(target).map_err(|error| format!("无法创建目标目录：{error}"))?;
     for entry in fs::read_dir(source).map_err(|error| format!("无法读取源目录：{error}"))? {
         let entry = entry.map_err(|error| format!("无法读取目录项：{error}"))?;
         let child_target = target.join(entry.file_name());
@@ -438,11 +438,69 @@ fn copy_directory(source: &Path, target: &Path) -> Result<(), String> {
         }
         if file_type.is_dir() {
             copy_directory(&entry.path(), &child_target)?;
+        } else if file_type.is_file() {
+            copy_file_contents(&entry.path(), &child_target)?;
         } else {
-            fs::copy(entry.path(), child_target).map_err(|error| format!("复制文件失败：{error}"))?;
+            return Err(format!("目录中包含不支持的文件类型：{}", entry.path().display()));
         }
     }
+    preserve_permissions(source, target);
     Ok(())
+}
+
+// Do not use fs::copy here. On Linux it may use kernel copy optimizations and
+// copy permission metadata that some FUSE, network, NTFS, and exFAT mounts do
+// not support. A userspace read/write loop is slower, but it is a dependable
+// fallback after rename reports that a move crosses filesystem boundaries.
+fn copy_file_contents(source: &Path, target: &Path) -> Result<(), String> {
+    let mut input = fs::File::open(source)
+        .map_err(|error| format!("无法读取源文件 {}：{error}", source.display()))?;
+    let mut output = create_copy_target(target)
+        .map_err(|error| format!("无法创建目标文件 {}：{error}", target.display()))?;
+    let mut buffer = vec![0_u8; 128 * 1024];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| format!("读取源文件 {} 失败：{error}", source.display()))?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("写入目标文件 {} 失败：{error}", target.display()))?;
+    }
+    output
+        .flush()
+        .map_err(|error| format!("刷新目标文件 {} 失败：{error}", target.display()))?;
+    drop(output);
+    preserve_permissions(source, target);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_copy_target(target: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        // Keep the temporary result private until source permissions can be
+        // applied. Filesystems without Unix permissions safely ignore this.
+        .mode(0o600)
+        .open(target)
+}
+
+#[cfg(not(unix))]
+fn create_copy_target(target: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).create_new(true).open(target)
+}
+
+fn preserve_permissions(source: &Path, target: &Path) {
+    if let Ok(metadata) = source.metadata() {
+        // Permission metadata is best-effort because several Linux-mounted
+        // filesystems can store file data but do not implement chmod.
+        let _ = fs::set_permissions(target, metadata.permissions());
+    }
 }
 
 fn unique_target(directory: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
@@ -536,6 +594,40 @@ mod tests {
             b"from wormhole"
         );
         fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn moves_directory_across_linux_filesystems() {
+        use std::os::unix::fs::MetadataExt;
+
+        let shared_memory = Path::new("/dev/shm");
+        if !shared_memory.is_dir()
+            || fs::metadata(std::env::temp_dir()).map(|value| value.dev()).ok()
+                == fs::metadata(shared_memory).map(|value| value.dev()).ok()
+        {
+            return;
+        }
+
+        let suffix = format!("{}-{}", std::process::id(), unix_timestamp());
+        let source_root = std::env::temp_dir().join(format!("codex-cosmos-cross-source-{suffix}"));
+        let destination = shared_memory.join(format!("codex-cosmos-cross-target-{suffix}"));
+        let source = source_root.join("payload");
+        fs::create_dir_all(source.join("nested")).expect("create source directory");
+        fs::create_dir_all(&destination).expect("create destination directory");
+        fs::write(source.join("nested/note.txt"), b"across filesystems")
+            .expect("create source file");
+
+        let moved_name = move_one(&source, &destination).expect("move across filesystems");
+
+        assert_eq!(moved_name, "payload");
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destination.join("payload/nested/note.txt")).unwrap(),
+            b"across filesystems"
+        );
+        fs::remove_dir_all(source_root).expect("clean source root");
+        fs::remove_dir_all(destination).expect("clean destination root");
     }
 
     #[test]
