@@ -705,6 +705,7 @@ function App() {
   const suppressWakeUntilLeave = useRef(false);
   const dropTargetRef = useRef<"trash" | "wormhole" | "forge">("trash");
   const lastNativeDropRef = useRef<{ signature: string; at: number } | null>(null);
+  const activeNativeDropsRef = useRef<Set<string>>(new Set());
   const lastClipboardRef = useRef<string | null>(null);
   const meteorsRef = useRef<{ id: number; x: number; y: number }[]>([]);
   const meteorIdRef = useRef(0);
@@ -1074,8 +1075,12 @@ function App() {
       const signature = `${target}\u0000${paths.join("\u0000")}`;
       const now = Date.now();
       const previousDrop = lastNativeDropRef.current;
-      if (previousDrop?.signature === signature && now - previousDrop.at < 750) return;
+      if (
+        activeNativeDropsRef.current.has(signature)
+        || (previousDrop?.signature === signature && now - previousDrop.at < 750)
+      ) return;
       lastNativeDropRef.current = { signature, at: now };
+      activeNativeDropsRef.current.add(signature);
       setDropState({
         phase: "processing",
         paths,
@@ -1110,7 +1115,10 @@ function App() {
         .catch((error) => {
           setDropState({ phase: "error", paths: [], message: String(error) });
           clearFeedbackLater(3800);
-      });
+        })
+        .finally(() => {
+          activeNativeDropsRef.current.delete(signature);
+        });
     }).then((stopListening) => {
       if (disposed) stopListening();
       else unlisten = stopListening;
