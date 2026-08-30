@@ -19,6 +19,7 @@ pub struct EffectCapabilities {
     session: String,
     desktop_capture: bool,
     programmatic_positioning: bool,
+    always_on_top_supported: bool,
     fallback_reason: Option<String>,
 }
 
@@ -30,6 +31,7 @@ pub fn effect_capabilities() -> EffectCapabilities {
         session: "desktop".into(),
         desktop_capture: true,
         programmatic_positioning: true,
+        always_on_top_supported: true,
         fallback_reason: None,
     };
 
@@ -43,8 +45,10 @@ pub fn effect_capabilities() -> EffectCapabilities {
             session,
             desktop_capture: false,
             programmatic_positioning: !wayland,
+            always_on_top_supported: !wayland,
             fallback_reason: Some(if wayland {
-                "Wayland 安全策略禁止无授权桌面采样，并可能限制窗口定位；使用内置星场与局部粒子".into()
+                "Wayland 安全策略禁止无授权桌面采样，并可能限制窗口定位；使用内置星场与局部粒子"
+                    .into()
             } else {
                 "Linux 当前使用内置星场与局部粒子，避免依赖桌面合成器私有接口".into()
             }),
@@ -57,6 +61,7 @@ pub fn effect_capabilities() -> EffectCapabilities {
         session: "quartz".into(),
         desktop_capture: false,
         programmatic_positioning: true,
+        always_on_top_supported: true,
         fallback_reason: Some("macOS 当前使用内置星场与局部粒子".into()),
     }
 }

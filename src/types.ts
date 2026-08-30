@@ -88,6 +88,7 @@ export interface EffectCapabilities {
   session: string;
   desktopCapture: boolean;
   programmaticPositioning: boolean;
+  alwaysOnTopSupported: boolean;
   fallbackReason?: string | null;
 }
 

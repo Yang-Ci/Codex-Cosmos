@@ -711,6 +711,8 @@ function App() {
   const meteorIdRef = useRef(0);
   const meteorTimersRef = useRef<Set<number>>(new Set());
   const quote = useMemo(() => quoteOfTheDay(settings.quoteCategory), [settings.quoteCategory]);
+  const topmostUnavailable = capabilities?.alwaysOnTopSupported === false;
+  const topmostActive = settings.topmost && !topmostUnavailable;
 
   const saveSettings = useCallback((next: Settings) => {
     setSettings(next);
@@ -904,6 +906,14 @@ function App() {
     if (!isTauri) return;
     void invoke("set_window_capture_exclusion", { enabled: settings.excludeFromCapture }).catch(() => {});
   }, [settings.excludeFromCapture]);
+
+  // Native window configuration is only the launch default. Reapply the saved
+  // preference after startup and whenever it changes. GNOME Wayland silently
+  // ignores this request, so capability detection keeps the control disabled.
+  useEffect(() => {
+    if (!isTauri || topmostUnavailable) return;
+    void getCurrentWindow().setAlwaysOnTop(settings.topmost).catch(() => {});
+  }, [settings.topmost, topmostUnavailable]);
 
   useEffect(() => {
     localStorage.setItem(storageKeys.focus, JSON.stringify(focusSession));
@@ -1287,10 +1297,9 @@ function App() {
     saveSettings({ ...settings, size });
   };
 
-  const toggleTopmost = async () => {
-    const next = !settings.topmost;
-    if (isTauri) await getCurrentWindow().setAlwaysOnTop(next);
-    saveSettings({ ...settings, topmost: next });
+  const toggleTopmost = () => {
+    if (topmostUnavailable) return;
+    saveSettings({ ...settings, topmost: !settings.topmost });
   };
 
   const toggleAutostart = async () => {
@@ -2173,7 +2182,7 @@ function App() {
             <div><strong>CODEX COSMOS</strong><small>DESKTOP COMPANION</small></div>
           </div>
           <div className="window-actions">
-            <button className="icon-button" onClick={toggleTopmost} title={settings.topmost ? "取消置顶" : "置顶"}>{settings.topmost ? <Pin size={14} /> : <PinOff size={14} />}</button>
+            <button className="icon-button" onClick={toggleTopmost} disabled={topmostUnavailable} title={topmostUnavailable ? "Wayland 下请按 Alt+Space，在系统窗口菜单中手动置顶" : topmostActive ? "取消置顶" : "置顶"}>{topmostActive ? <Pin size={14} /> : <PinOff size={14} />}</button>
             <button className="icon-button" onClick={() => setSettingsOpen(true)} title="设置"><Settings2 size={15} /></button>
             <button className="icon-button" onClick={hideWindow} title="隐藏到托盘"><Minimize2 size={14} /></button>
             <button className="icon-button close" onClick={closeWindow} title="退出"><X size={15} /></button>
@@ -2357,7 +2366,7 @@ function App() {
                 <div className="search-box"><Search size={14} /><input value={locationQuery} onChange={(e) => setLocationQuery(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void performLocationSearch(); }} placeholder={`${settings.location.name} · 搜索城市`} /><button onClick={performLocationSearch}>搜索</button></div>
                 {locationResults.length > 0 && <div className="location-results">{locationResults.map((result) => <button key={`${result.latitude}-${result.longitude}`} onClick={() => chooseLocation(result)}><MapPin size={13}/><span>{result.name}<small>{[result.admin1, result.country].filter(Boolean).join(" · ")}</small></span><ChevronDown size={12}/></button>)}</div>}
               </div>
-              <div className="setting-row"><div><strong>始终置顶</strong><span>让组件保持在其他窗口上方</span></div><button className={`toggle ${settings.topmost ? "on" : ""}`} onClick={toggleTopmost}><i /></button></div>
+              <div className="setting-row"><div><strong>始终置顶</strong><span>{topmostUnavailable ? "Wayland 下请按 Alt+Space 手动置顶，或登录 Ubuntu on Xorg 使用开关" : "让组件保持在其他窗口上方"}</span></div><button className={`toggle ${topmostActive ? "on" : ""}`} onClick={toggleTopmost} disabled={topmostUnavailable} aria-label="始终置顶"><i /></button></div>
               <div className="setting-row"><div><strong>截图隐身</strong><span>窗口排除出截图与录屏；关闭后可被截到，但黑洞透镜会显示自身界面</span></div><button className={`toggle ${settings.excludeFromCapture ? "on" : ""}`} onClick={() => saveSettings({ ...settings, excludeFromCapture: !settings.excludeFromCapture })}><i /></button></div>
               <div className="setting-row"><div><strong>开机启动</strong><span>登录系统后自动运行</span></div><button className={`toggle ${settings.autostart ? "on" : ""}`} onClick={toggleAutostart}><i /></button></div>
               <div className="setting-row"><div><strong>自动回收</strong><span>关闭后标签以面板形式常驻，双击仍可手动收回</span></div><button className={`toggle ${settings.autoCollapseEnabled ? "on" : ""}`} onClick={toggleAutoCollapse}><i /></button></div>
