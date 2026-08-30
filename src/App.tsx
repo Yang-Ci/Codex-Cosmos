@@ -704,6 +704,7 @@ function App() {
   const windowScaleFactorRef = useRef(1);
   const suppressWakeUntilLeave = useRef(false);
   const dropTargetRef = useRef<"trash" | "wormhole" | "forge">("trash");
+  const lastNativeDropRef = useRef<{ signature: string; at: number } | null>(null);
   const lastClipboardRef = useRef<string | null>(null);
   const meteorsRef = useRef<{ id: number; x: number; y: number }[]>([]);
   const meteorIdRef = useRef(0);
@@ -977,20 +978,26 @@ function App() {
   useEffect(() => {
     if (!isTauri) return;
     const appWindow = getCurrentWindow();
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void appWindow.scaleFactor().then((factor) => {
       windowScaleFactorRef.current = factor;
     });
     void appWindow.onScaleChanged(({ payload }) => {
       windowScaleFactorRef.current = payload.scaleFactor;
-    }).then((dispose) => {
-      unlisten = dispose;
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
     });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
     if (!isTauri) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onDragDropEvent(({ payload }) => {
       const targetAt = (x: number, y: number) => {
@@ -1064,6 +1071,11 @@ function App() {
       nativeFileDrag.current = false;
       const paths = payload.paths;
       const target = dropTargetRef.current;
+      const signature = `${target}\u0000${paths.join("\u0000")}`;
+      const now = Date.now();
+      const previousDrop = lastNativeDropRef.current;
+      if (previousDrop?.signature === signature && now - previousDrop.at < 750) return;
+      lastNativeDropRef.current = { signature, at: now };
       setDropState({
         phase: "processing",
         paths,
@@ -1098,20 +1110,29 @@ function App() {
         .catch((error) => {
           setDropState({ phase: "error", paths: [], message: String(error) });
           clearFeedbackLater(3800);
-        });
-    }).then((dispose) => {
-      unlisten = dispose;
+      });
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
     });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, [capabilities?.platform, clearFeedbackLater, ecosystemStats.wormholeDestination, loadEcosystemStats, loadRecycleHistory, settings.autoCollapseEnabled]);
 
   useEffect(() => {
     if (!isTauri) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
-    void listen("quota-refresh-requested", () => void loadQuota()).then((dispose) => {
-      unlisten = dispose;
+    void listen("quota-refresh-requested", () => void loadQuota()).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
     });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, [loadQuota]);
 
   useEffect(() => {
