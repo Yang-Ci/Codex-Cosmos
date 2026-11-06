@@ -710,6 +710,7 @@ function App() {
   const meteorsRef = useRef<{ id: number; x: number; y: number }[]>([]);
   const meteorIdRef = useRef(0);
   const meteorTimersRef = useRef<Set<number>>(new Set());
+  const quotaRequestIdRef = useRef(0);
   const quote = useMemo(() => quoteOfTheDay(settings.quoteCategory), [settings.quoteCategory]);
   const topmostUnavailable = capabilities?.alwaysOnTopSupported === false;
   const topmostActive = settings.topmost && !topmostUnavailable;
@@ -757,19 +758,30 @@ function App() {
   }, []);
 
   const loadQuota = useCallback(async () => {
+    const requestId = ++quotaRequestIdRef.current;
     setLoadingQuota(true);
     try {
       const data = isTauri ? await invoke<PulseData>("get_pulse_data") : mockPulse;
-      setPulse(data);
+      if (requestId === quotaRequestIdRef.current) setPulse(data);
     } catch (error) {
-      setPulse({
-        quota: null,
-        history: [],
-        monthlyEstimate: { usedPercent: 0, confidence: "low", samples: 0, label: "数据不足" },
-        error: String(error),
-      });
+      if (requestId === quotaRequestIdRef.current) {
+        setPulse((current) => current
+          ? {
+              ...current,
+              quota: current.quota
+                ? { ...current.quota, source: "memory-cache", stale: true }
+                : null,
+              error: String(error),
+            }
+          : {
+              quota: null,
+              history: [],
+              monthlyEstimate: { usedPercent: 0, confidence: "low", samples: 0, label: "数据不足" },
+              error: String(error),
+            });
+      }
     } finally {
-      setLoadingQuota(false);
+      if (requestId === quotaRequestIdRef.current) setLoadingQuota(false);
     }
   }, []);
 
@@ -2274,7 +2286,7 @@ function App() {
           </div>
           <div className="quota-metrics">
             <div><span>30 天消耗</span><strong>{pulse ? `${Math.round(pulse.monthlyEstimate.usedPercent)}%` : "--"}</strong><small>{pulse?.monthlyEstimate.label ?? "本地估算"}</small></div>
-            <div><span>数据状态</span><strong>{quota?.stale ? "较旧" : quota ? "已同步" : "离线"}</strong><small>{quota ? new Date(quota.sampledAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "等候采样"}</small></div>
+            <div><span>数据状态</span><strong>{quota?.source.includes("cache") ? "已缓存" : quota?.stale ? "较旧" : quota ? "已同步" : "离线"}</strong><small>{quota ? new Date(quota.sampledAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) : "等候采样"}</small></div>
             <div><span>额度提醒</span><strong>{remaining > settings.lowQuotaThreshold ? "充足" : "注意"}</strong><small>阈值 {settings.lowQuotaThreshold}%</small></div>
           </div>
         </section>

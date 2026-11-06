@@ -13,12 +13,13 @@ use std::{
 use tauri::Manager;
 use walkdir::WalkDir;
 
-const MAX_SESSION_FILES: usize = 50;
+const RECENT_SESSION_FILES: usize = 50;
+const MAX_SESSION_FILES: usize = 250;
 const MAX_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const HISTORY_DAYS: i64 = 45;
 const RESET_TIME_TOLERANCE_SECONDS: u64 = 5 * 60;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateWindow {
     pub used_percent: f64,
@@ -27,7 +28,7 @@ pub struct RateWindow {
     pub resets_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreditStatus {
     pub has_credits: bool,
@@ -35,7 +36,7 @@ pub struct CreditStatus {
     pub balance: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaSnapshot {
     pub found: bool,
@@ -83,25 +84,65 @@ struct CandidateEvent {
     snapshot: QuotaSnapshot,
 }
 
+#[derive(Debug, Default)]
+struct QuotaScan {
+    events: Vec<CandidateEvent>,
+    skipped_files: usize,
+}
+
 pub fn collect_pulse_data(app: &tauri::AppHandle) -> Result<PulseData, String> {
-    let events = find_quota_events()?;
-    let latest = events.last().map(|event| event.snapshot.clone());
-    let history_path = app
+    let data_dir = app
         .path()
         .app_data_dir()
-        .map_err(|error| format!("无法找到应用数据目录: {error}"))?
-        .join("quota-history.json");
+        .map_err(|error| format!("无法找到应用数据目录: {error}"))?;
+    let history_path = data_dir.join("quota-history.json");
+    let snapshot_path = data_dir.join("quota-snapshot.json");
+    let mut warnings = Vec::new();
+
+    let scan = match find_quota_events() {
+        Ok(scan) => scan,
+        Err(error) => {
+            warnings.push(error);
+            QuotaScan::default()
+        }
+    };
+    if scan.skipped_files > 0 {
+        warnings.push(format!(
+            "已跳过 {} 个暂时无法读取的 Codex 会话文件",
+            scan.skipped_files
+        ));
+    }
+
+    let mut latest = scan.events.last().map(|event| event.snapshot.clone());
 
     let mut history = read_history(&history_path);
-    if !events.is_empty() {
-        merge_samples(&mut history, &events);
+    if !scan.events.is_empty() {
+        merge_samples(&mut history, &scan.events);
     }
 
     let cutoff = Utc::now().timestamp() - HISTORY_DAYS * 86_400;
     history.retain(|point| point.sampled_at >= cutoff);
-    if !events.is_empty() {
-        write_history(&history_path, &history)?;
+    if !scan.events.is_empty() {
+        if let Err(error) = write_history(&history_path, &history) {
+            warnings.push(error);
+        }
     }
+
+    if let Some(snapshot) = latest.as_ref() {
+        if let Err(error) = write_snapshot(&snapshot_path, snapshot) {
+            warnings.push(error);
+        }
+    } else {
+        latest = read_snapshot(&snapshot_path)
+            .map(|snapshot| mark_cached(snapshot, "local-cache"))
+            .or_else(|| snapshot_from_history(&history));
+        if latest.is_some() {
+            warnings.push("未发现新的官方额度事件，正在显示上次成功数据".to_string());
+        } else {
+            warnings.push("未找到可用的 Codex 官方额度事件".to_string());
+        }
+    }
+
     let estimate_window = latest.as_ref().map(|snapshot| {
         snapshot
             .secondary
@@ -121,7 +162,7 @@ pub fn collect_pulse_data(app: &tauri::AppHandle) -> Result<PulseData, String> {
         quota: latest,
         history,
         monthly_estimate: estimate,
-        error: None,
+        error: (!warnings.is_empty()).then(|| warnings.join("；")),
     })
 }
 
@@ -136,7 +177,7 @@ fn codex_home() -> Result<PathBuf, String> {
         .ok_or_else(|| "无法找到用户主目录".to_string())
 }
 
-fn find_quota_events() -> Result<Vec<CandidateEvent>, String> {
+fn find_quota_events() -> Result<QuotaScan, String> {
     let root = codex_home()?;
     let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
 
@@ -165,20 +206,35 @@ fn find_quota_events() -> Result<Vec<CandidateEvent>, String> {
 
     candidates.sort_by_key(|(modified, _)| Reverse(*modified));
     candidates.truncate(MAX_SESSION_FILES);
+    Ok(scan_quota_candidates(
+        candidates.into_iter().map(|(_, path)| path),
+    ))
+}
 
-    let mut events = Vec::new();
-    for (_, path) in candidates {
-        for line in read_tail_lines(&path)? {
+fn scan_quota_candidates(paths: impl IntoIterator<Item = PathBuf>) -> QuotaScan {
+    let mut scan = QuotaScan::default();
+    for (index, path) in paths.into_iter().enumerate() {
+        let lines = match read_tail_lines(&path) {
+            Ok(lines) => lines,
+            Err(_) => {
+                scan.skipped_files += 1;
+                continue;
+            }
+        };
+        for line in lines {
             let Some(event) = parse_quota_event(&line) else {
                 continue;
             };
-            events.push(event);
+            scan.events.push(event);
+        }
+        if index + 1 >= RECENT_SESSION_FILES && !scan.events.is_empty() {
+            break;
         }
     }
 
-    events.sort_by_key(|event| event.sampled_at);
-    events.dedup_by_key(|event| event.sampled_at);
-    Ok(events)
+    scan.events.sort_by_key(|event| event.sampled_at);
+    scan.events.dedup_by_key(|event| event.sampled_at);
+    scan
 }
 
 fn read_tail_lines(path: &Path) -> Result<Vec<String>, String> {
@@ -274,6 +330,83 @@ fn read_history(path: &Path) -> Vec<QuotaHistoryPoint> {
         .ok()
         .and_then(|content| serde_json::from_str(&content).ok())
         .unwrap_or_default()
+}
+
+fn read_snapshot(path: &Path) -> Option<QuotaSnapshot> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+}
+
+fn write_snapshot(path: &Path, snapshot: &QuotaSnapshot) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建额度缓存目录失败: {error}"))?;
+    }
+    let content =
+        serde_json::to_string(snapshot).map_err(|error| format!("序列化额度缓存失败: {error}"))?;
+    fs::write(path, content).map_err(|error| format!("保存额度缓存失败: {error}"))
+}
+
+fn snapshot_is_stale(sampled_at: &str) -> bool {
+    DateTime::parse_from_rfc3339(sampled_at)
+        .map(|sampled_at| {
+            Utc::now()
+                .signed_duration_since(sampled_at.with_timezone(&Utc))
+                .num_hours()
+                >= 6
+        })
+        .unwrap_or(true)
+}
+
+fn mark_cached(mut snapshot: QuotaSnapshot, source: &str) -> QuotaSnapshot {
+    snapshot.stale = snapshot_is_stale(&snapshot.sampled_at);
+    snapshot.source = source.to_string();
+    snapshot
+}
+
+fn snapshot_from_history(history: &[QuotaHistoryPoint]) -> Option<QuotaSnapshot> {
+    let mut latest_by_window = BTreeMap::new();
+    for point in history {
+        latest_by_window
+            .entry(point.window_minutes)
+            .and_modify(|current: &mut QuotaHistoryPoint| {
+                if point.sampled_at > current.sampled_at {
+                    *current = point.clone();
+                }
+            })
+            .or_insert_with(|| point.clone());
+    }
+
+    let mut points = latest_by_window.into_values();
+    let primary_point = points.next()?;
+    let secondary_point = points.next_back();
+    let sampled_at = DateTime::<Utc>::from_timestamp(primary_point.sampled_at, 0)?.to_rfc3339();
+    let primary = window_from_history(&primary_point);
+    let secondary = secondary_point.as_ref().map(window_from_history);
+
+    Some(mark_cached(
+        QuotaSnapshot {
+            found: true,
+            sampled_at,
+            plan_type: "unknown".to_string(),
+            limit_id: "codex".to_string(),
+            primary,
+            secondary,
+            credits: None,
+            source: "history-cache".to_string(),
+            stale: true,
+        },
+        "history-cache",
+    ))
+}
+
+fn window_from_history(point: &QuotaHistoryPoint) -> RateWindow {
+    RateWindow {
+        used_percent: point.used_percent,
+        remaining_percent: (100.0 - point.used_percent).clamp(0.0, 100.0),
+        window_minutes: point.window_minutes,
+        resets_at: point.resets_at,
+    }
 }
 
 fn write_history(path: &Path, history: &[QuotaHistoryPoint]) -> Result<(), String> {
@@ -404,6 +537,23 @@ fn estimate_monthly_usage(history: &[QuotaHistoryPoint]) -> MonthlyEstimate {
 mod tests {
     use super::*;
 
+    fn test_directory(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "codex-cosmos-quota-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn valid_quota_line() -> &'static str {
+        r#"{"timestamp":"2026-08-28T03:43:26.893Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":38.0,"window_minutes":300,"resets_at":1787898519},"secondary":{"used_percent":15.0,"window_minutes":10080,"resets_at":1788485319},"plan_type":"plus"}}}"#
+    }
+
     #[test]
     fn parses_realistic_quota_event() {
         let line = r#"{"timestamp":"2026-08-13T12:20:15.223Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":35.0,"window_minutes":10080,"resets_at":1787204698},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"plan_type":"plus"}}}"#;
@@ -426,6 +576,65 @@ mod tests {
         assert_eq!(event.snapshot.primary.remaining_percent, 2.0);
         assert_eq!(weekly.window_minutes, 10_080);
         assert_eq!(weekly.remaining_percent, 85.0);
+    }
+
+    #[test]
+    fn scan_continues_past_custom_provider_sessions() {
+        let root = test_directory("custom-fallback");
+        let mut paths = Vec::new();
+        let custom_line = r#"{"timestamp":"2026-08-28T03:43:26.893Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":null,"secondary":null}}}"#;
+        for index in 0..RECENT_SESSION_FILES {
+            let path = root.join(format!("custom-{index}.jsonl"));
+            fs::write(&path, custom_line).unwrap();
+            paths.push(path);
+        }
+        let official_path = root.join("official.jsonl");
+        fs::write(&official_path, valid_quota_line()).unwrap();
+        paths.push(official_path);
+
+        let scan = scan_quota_candidates(paths);
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].snapshot.primary.window_minutes, 300);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_skips_a_disappeared_session_file() {
+        let root = test_directory("skip-missing");
+        let missing = root.join("already-removed.jsonl");
+        let official_path = root.join("official.jsonl");
+        fs::write(&official_path, valid_quota_line()).unwrap();
+
+        let scan = scan_quota_candidates(vec![missing, official_path]);
+
+        assert_eq!(scan.skipped_files, 1);
+        assert_eq!(scan.events.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebuilds_a_cached_snapshot_from_history() {
+        let history = vec![
+            QuotaHistoryPoint {
+                sampled_at: 1_787_898_000,
+                used_percent: 38.0,
+                window_minutes: 300,
+                resets_at: 1_787_898_519,
+            },
+            QuotaHistoryPoint {
+                sampled_at: 1_787_898_000,
+                used_percent: 15.0,
+                window_minutes: 10_080,
+                resets_at: 1_788_485_319,
+            },
+        ];
+
+        let snapshot = snapshot_from_history(&history).unwrap();
+
+        assert_eq!(snapshot.source, "history-cache");
+        assert_eq!(snapshot.primary.remaining_percent, 62.0);
+        assert_eq!(snapshot.secondary.unwrap().remaining_percent, 85.0);
     }
 
     #[test]
